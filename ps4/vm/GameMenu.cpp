@@ -7,6 +7,7 @@
 #include "ReleaseCheck.h"
 #include "GameDatabase.h"
 #include "GameList.h"
+#include "ps2/BiosTools.h"
 #include "CDVD/IsoFileFormats.h"
 #include "common/Error.h"
 #include "MTGS.h"
@@ -46,6 +47,11 @@ namespace PS4GameMenu
 		constexpr const char* CoversDirectory = "/data/PS4SX2/covers";
 		constexpr const char* FavoritesFile = "/data/PS4SX2/favorites.txt";
 		constexpr const char* RecentFile = "/data/PS4SX2/recent.txt";
+		constexpr const char* BiosDirectory = "/data/PS4SX2/bios";
+		// Library card that boots the PS2 BIOS with no disc (original system menu).
+		// Not a real file path; Select() returns an empty path for it.
+		constexpr const char* BiosEntryPath = "ps4sx2://bios";
+		constexpr const char* BiosEntryName = "Menú del sistema PS2 (BIOS)";
 		constexpr const char* UiAssetsDirectory = "/app0/resources/ui";
 		constexpr const char* IntroDirectory = "/app0/resources/intro";
 		constexpr size_t GridColumns = 4;
@@ -362,6 +368,33 @@ namespace PS4GameMenu
 			return success;
 		}
 
+		// True when /data/PS4SX2/bios contains at least one valid PS2 BIOS image.
+		bool HasBiosImage()
+		{
+			DIR* dir = opendir(BiosDirectory);
+			if (!dir)
+				return false;
+			bool found = false;
+			while (dirent* entry = readdir(dir))
+			{
+				if (entry->d_name[0] == '.')
+					continue;
+				const std::string full = std::string(BiosDirectory) + "/" + entry->d_name;
+				struct stat info{};
+				if (stat(full.c_str(), &info) != 0 || !S_ISREG(info.st_mode))
+					continue;
+				u32 version = 0, region = 0;
+				std::string description, zone;
+				if (IsBIOS(full.c_str(), version, description, region, zone))
+				{
+					found = true;
+					break;
+				}
+			}
+			closedir(dir);
+			return found;
+		}
+
 		std::vector<Item> BuildView(const std::vector<Item>& library, LibraryView view,
 			const std::vector<std::string>& favorites, const std::vector<std::string>& recent)
 		{
@@ -384,6 +417,13 @@ namespace PS4GameMenu
 			}
 			else if (view == LibraryView::Library || view == LibraryView::Favorites)
 			{
+				// The first Library card boots the original PS2 system menu.
+				if (view == LibraryView::Library)
+				{
+					Item bios{BiosEntryName, BiosEntryPath, {}, false};
+					bios.platform = GamePlatform::PS2;
+					items.push_back(std::move(bios));
+				}
 				for (Item item : library)
 				{
 					item.favorite = ContainsPath(favorites, item.path);
@@ -391,7 +431,7 @@ namespace PS4GameMenu
 						items.push_back(std::move(item));
 				}
 			}
-			if (items.empty())
+			if (items.empty() || (view == LibraryView::Library && items.size() == 1))
 			{
 				const char* message = view == LibraryView::Disc      ? "No disc detected" :
 				                      view == LibraryView::Recent    ? "No recent games" :
@@ -928,7 +968,7 @@ namespace PS4GameMenu
 			if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !sidebar_focused && view != LibraryView::Disc)
 			{
 				const std::string selected_path = items[selected].path;
-				if (!selected_path.empty())
+				if (!selected_path.empty() && selected_path != BiosEntryPath)
 				{
 					const auto found = std::find(favorites.begin(), favorites.end(), selected_path);
 					const bool removing = found != favorites.end();
@@ -962,7 +1002,27 @@ namespace PS4GameMenu
 				}
 				path = items[selected].path;
 				struct stat info{};
-				if (path.empty())
+				if (path == BiosEntryPath)
+				{
+					if (!HasBiosImage())
+					{
+						status = "No se encontró BIOS de PS2. Copia un archivo BIOS a /data/PS4SX2/bios.";
+						path.clear();
+					}
+					else
+					{
+						Present(selected, "Iniciando menú del sistema PS2...", connected, false, false, false);
+						while (scePadReadState(pad, &data) == 0 && data.connected && (data.buttons & ORBIS_PAD_BUTTON_CROSS))
+							Threading::Sleep(16);
+						// Empty path = boot the BIOS with no disc (main.cpp uses CDVD_SourceType::NoDisc).
+						path.clear();
+						platform = GamePlatform::PS2;
+						start = true;
+						ProbeLog("Game menu: selected PS2 System Menu (BIOS, no disc)\n");
+						break;
+					}
+				}
+				else if (path.empty())
 					status = view == LibraryView::Disc     ? "Physical disc support is being prepared." :
 					         view == LibraryView::Settings ? "Settings options will be added here." :
 					                                         "No game is available in this view.";
@@ -1393,6 +1453,11 @@ namespace PS4GameMenu
 					draw->AddLine(point(x + 2, y + 80 + stripe * 66), point(x + card_w - 2, y + 42 + stripe * 66), IM_COL32(139, 207, 255, 30), 2.0f * scale);
 				draw->AddCircleFilled(point(x + card_w * 0.5f, y + card_h * 0.5f), 46 * scale,
 					focused ? IM_COL32(56, 151, 224, 235) : IM_COL32(35, 98, 143, 225), 48);
+				if (s_items[index].path == BiosEntryPath)
+				{
+					text(x + 24, y + card_h - 74, 24, white, "Menú de PS2");
+					text(x + 24, y + card_h - 40, 17, muted, "Iniciar BIOS sin disco");
+				}
 			}
 			if (s_items[index].favorite)
 			{
@@ -1415,7 +1480,7 @@ namespace PS4GameMenu
 		if (!disc_view)
 		{
 			image("controle_quadrado", 500, 1001, 30, 30);
-			text(538, 1023, 16, current.path.empty() ? muted : white,
+			text(538, 1023, 16, current.path.empty() || current.path == BiosEntryPath ? muted : white,
 				current.favorite ? "Remove favorite" : "Add favorite");
 		}
 		// Disc has no favorite action: use the next Library slots without an empty gap.
