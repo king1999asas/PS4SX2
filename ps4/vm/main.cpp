@@ -588,6 +588,37 @@ static void PrepareEmulatorFolders(SettingsInterface& settings)
 	}
 }
 
+// (fork) Re-read the launcher Settings markers after the game menu closes, so a
+// change made in Settings applies to the game started now. Fastmem stays as set
+// before CPUThreadInitialize (its VTLB mappings already exist).
+static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
+{
+	int ee_cycle_rate = -1;
+	if (access("/data/PS4SX2/vm-ee-cycle-normal", F_OK) == 0)
+		ee_cycle_rate = 0;
+	else if (access("/data/PS4SX2/vm-ee-cycle-underclock", F_OK) == 0)
+		ee_cycle_rate = -2;
+	settings->SetIntValue("EmuCore/Speedhacks", "EECycleRate", ee_cycle_rate);
+	const int ee_cycle_skip = access("/data/PS4SX2/vm-ee-cycle-skip2", F_OK) == 0 ? 2 :
+	                          access("/data/PS4SX2/vm-ee-cycle-skip", F_OK) == 0 ? 1 : 0;
+	settings->SetIntValue("EmuCore/Speedhacks", "EECycleSkip", ee_cycle_skip);
+	const bool fast_cdvd = access("/data/PS4SX2/vm-fast-cdvd", F_OK) == 0 &&
+	                       access("/data/PS4SX2/vm-no-fast-cdvd", F_OK) != 0;
+	settings->SetBoolValue("EmuCore/Speedhacks", "fastCDVD", fast_cdvd);
+	fast_boot = access("/data/PS4SX2/vm-no-fast-boot", F_OK) != 0;
+	settings->SetBoolValue("EmuCore", "EnableFastBoot", fast_boot);
+	settings->SetBoolValue("EmuCore", "EnableFastBootFastForward", fast_boot);
+	const bool audio_enabled = access("/data/PS4SX2/vm-no-audio", F_OK) != 0;
+	settings->SetStringValue("SPU2/Output", "Backend", audio_enabled ? "Cubeb" : "Null");
+#if defined(PCSX2_PS4_VM_BOOT_JIT)
+	g_ps4_skip_smc_checks = access("/data/PS4SX2/vm-skip-smc", F_OK) == 0;
+	g_ps4_bytecopy_fusion = g_ps4_skip_smc_checks && access("/data/PS4SX2/vm-no-bytecopy-fusion", F_OK) != 0;
+#endif
+	VMManager::ApplySettings();
+	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d\n",
+		ee_cycle_rate, ee_cycle_skip, fast_cdvd ? 1 : 0, fast_boot ? 1 : 0, audio_enabled ? 1 : 0);
+}
+
 static void* RunVM(void*)
 {
 	PS4ThreadAffinity::PinCurrentThread("EE", 2);
@@ -619,7 +650,9 @@ static void* RunVM(void*)
 	// (AI-assisted) Fase 3-A reverted: EECycleSkip=1 gave -1.2pp on GoW FMV (32.8ms vs 31.4ms) and no gain on GTA.
 	// Reverted to 0 (opt-in via /data/PS4SX2/vm-ee-cycle-skip only). Needs proper testing.
 	int ee_cycle_skip = 0;
-	if (access("/data/PS4SX2/vm-ee-cycle-skip", F_OK) == 0)
+	if (access("/data/PS4SX2/vm-ee-cycle-skip2", F_OK) == 0)
+		ee_cycle_skip = 2;
+	else if (access("/data/PS4SX2/vm-ee-cycle-skip", F_OK) == 0)
 		ee_cycle_skip = 1;
 	settings->SetIntValue("EmuCore/Speedhacks", "EECycleSkip", ee_cycle_skip);
 	ProbeLog("EE cycle profile requested: rate=%d skip=%d (underclock marker=%s, mild marker=%s, normal marker=%s, skip marker=%s)\n",
@@ -789,6 +822,7 @@ static void* RunVM(void*)
 			return nullptr;
 		}
 	}
+	ApplyLauncherSettings(settings, fast_boot);
 	if (platform == GamePlatform::PS1)
 	{
 		// (AI-assisted) PS1DRV takes over the EE after the BIOS. Do not carry the
