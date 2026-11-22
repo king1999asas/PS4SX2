@@ -28,12 +28,14 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cfloat>
 #include <cstring>
 #include <dirent.h>
 #include <memory>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -80,6 +82,7 @@ namespace PS4GameMenu
 			bool favorite = false;
 			std::string serial;
 			GamePlatform platform = GamePlatform::Unknown;
+			std::string detail; // Settings cards: current value
 		};
 		struct CoverTexture
 		{
@@ -368,6 +371,89 @@ namespace PS4GameMenu
 			return success;
 		}
 
+		// Settings view. Each option is stored as the marker files that main.cpp
+		// reads, so it applies to the next game started from the launcher.
+		constexpr const char* SettingPrefix = "ps4sx2://setting/";
+		constexpr size_t SettingCount = 6;
+		struct LauncherSetting
+		{
+			const char* name;
+			const char* help;
+			const char* values[3];
+			unsigned count;
+		};
+		constexpr LauncherSetting LauncherSettings[SettingCount] = {
+			{"Carga de CPU (EE)", "Menos carga = menos lag en juegos pesados. Si un juego va lento o raro, prueba otro nivel.",
+				{"Normal (100%)", "Reducida (75%)", "Muy reducida (60%)"}, 3},
+			{"Saltar ciclos EE", "Gana velocidad en juegos lentos. Puede causar fallos en algunos juegos.",
+				{"No", "Nivel 1", "Nivel 2"}, 3},
+			{"Carga rápida de disco", "Acorta las cargas. Algunos juegos se cuelgan con esto activado.",
+				{"No", "Sí"}, 2},
+			{"JIT rápido", "Más velocidad de CPU. Puede romper juegos como GTA San Andreas.",
+				{"No", "Sí"}, 2},
+			{"Intro de la BIOS", "Al iniciar un juego, salta o muestra la animación de la PS2.",
+				{"Saltar", "Mostrar"}, 2},
+			{"Sonido", "Desactivarlo ahorra algo de CPU en juegos muy pesados.",
+				{"Activado", "Desactivado"}, 2},
+		};
+		bool Marker(const char* name)
+		{
+			return access((std::string("/data/PS4SX2/") + name).c_str(), F_OK) == 0;
+		}
+		void SetMarker(const char* name, bool on)
+		{
+			const std::string path = std::string("/data/PS4SX2/") + name;
+			if (on)
+			{
+				if (FILE* file = std::fopen(path.c_str(), "wb"))
+					std::fclose(file);
+			}
+			else
+				std::remove(path.c_str());
+		}
+		bool IsSettingPath(const std::string& path)
+		{
+			return path.rfind(SettingPrefix, 0) == 0;
+		}
+		size_t SettingIndex(const std::string& path)
+		{
+			return std::min<size_t>(std::strtoul(path.c_str() + std::strlen(SettingPrefix), nullptr, 10), SettingCount - 1);
+		}
+		unsigned GetSetting(size_t id)
+		{
+			switch (id)
+			{
+				case 0: return Marker("vm-ee-cycle-normal") ? 0u : Marker("vm-ee-cycle-underclock") ? 2u : 1u;
+				case 1: return Marker("vm-ee-cycle-skip2") ? 2u : Marker("vm-ee-cycle-skip") ? 1u : 0u;
+				case 2: return Marker("vm-fast-cdvd") && !Marker("vm-no-fast-cdvd") ? 1u : 0u;
+				case 3: return Marker("vm-skip-smc") ? 1u : 0u;
+				case 4: return Marker("vm-no-fast-boot") ? 1u : 0u;
+				default: return Marker("vm-no-audio") ? 1u : 0u;
+			}
+		}
+		void SetSetting(size_t id, unsigned value)
+		{
+			switch (id)
+			{
+				case 0:
+					SetMarker("vm-ee-cycle-mild", false);
+					SetMarker("vm-ee-cycle-normal", value == 0);
+					SetMarker("vm-ee-cycle-underclock", value == 2);
+					break;
+				case 1:
+					SetMarker("vm-ee-cycle-skip", value == 1);
+					SetMarker("vm-ee-cycle-skip2", value == 2);
+					break;
+				case 2:
+					SetMarker("vm-no-fast-cdvd", false);
+					SetMarker("vm-fast-cdvd", value == 1);
+					break;
+				case 3: SetMarker("vm-skip-smc", value == 1); break;
+				case 4: SetMarker("vm-no-fast-boot", value == 1); break;
+				default: SetMarker("vm-no-audio", value == 1); break;
+			}
+		}
+
 		// True when /data/PS4SX2/bios contains at least one valid PS2 BIOS image.
 		bool HasBiosImage()
 		{
@@ -402,6 +488,16 @@ namespace PS4GameMenu
 			if (view == LibraryView::Disc)
 			{
 				// Detection is asynchronous; the CPU publishes the result when it is ready.
+			}
+			else if (view == LibraryView::Settings)
+			{
+				for (size_t id = 0; id < SettingCount; ++id)
+				{
+					Item item{LauncherSettings[id].name, std::string(SettingPrefix) + std::to_string(id), {}, false};
+					item.detail = LauncherSettings[id].values[std::min(GetSetting(id), LauncherSettings[id].count - 1)];
+					item.name = std::string(LauncherSettings[id].name) + ": " + item.detail;
+					items.push_back(std::move(item));
+				}
 			}
 			else if (view == LibraryView::Recent)
 			{
@@ -968,7 +1064,7 @@ namespace PS4GameMenu
 			if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !sidebar_focused && view != LibraryView::Disc)
 			{
 				const std::string selected_path = items[selected].path;
-				if (!selected_path.empty() && selected_path != BiosEntryPath)
+				if (!selected_path.empty() && selected_path != BiosEntryPath && !IsSettingPath(selected_path))
 				{
 					const auto found = std::find(favorites.begin(), favorites.end(), selected_path);
 					const bool removing = found != favorites.end();
@@ -996,6 +1092,20 @@ namespace PS4GameMenu
 				{
 					// Re-probe before launch, so an ejected/replaced DVD cannot use old metadata.
 					probe_disc(true);
+					Present(selected, status, connected, false, false, false);
+					Threading::Sleep(16);
+					continue;
+				}
+				if (view == LibraryView::Settings && IsSettingPath(items[selected].path))
+				{
+					const size_t id = SettingIndex(items[selected].path);
+					const unsigned value = (GetSetting(id) + 1) % LauncherSettings[id].count;
+					SetSetting(id, value);
+					status = std::string(LauncherSettings[id].name) + ": " + LauncherSettings[id].values[value] +
+					         ". Se aplica al iniciar el próximo juego.";
+					ProbeLog("Game menu: setting %s -> %s\n", LauncherSettings[id].name, LauncherSettings[id].values[value]);
+					items = BuildView(library, view, favorites, recent);
+					Publish(items, view);
 					Present(selected, status, connected, false, false, false);
 					Threading::Sleep(16);
 					continue;
@@ -1453,7 +1563,17 @@ namespace PS4GameMenu
 					draw->AddLine(point(x + 2, y + 80 + stripe * 66), point(x + card_w - 2, y + 42 + stripe * 66), IM_COL32(139, 207, 255, 30), 2.0f * scale);
 				draw->AddCircleFilled(point(x + card_w * 0.5f, y + card_h * 0.5f), 46 * scale,
 					focused ? IM_COL32(56, 151, 224, 235) : IM_COL32(35, 98, 143, 225), 48);
-				if (s_items[index].path == BiosEntryPath)
+				if (IsSettingPath(s_items[index].path))
+				{
+					const LauncherSetting& setting = LauncherSettings[SettingIndex(s_items[index].path)];
+					fill(x + 2, y + 2, card_w - 4, card_h - 4, focused ? IM_COL32(18, 53, 86, 255) : card_bg, 7);
+					draw->AddText(font, 24 * scale, point(x + 22, y + 26), white, setting.name, nullptr, (card_w - 44) * scale);
+					fill(x + 20, y + 120, card_w - 40, 64, IM_COL32(45, 153, 255, focused ? 255 : 170), 12);
+					centered_text(x + card_w * 0.5f, y + 162, 22, white, s_items[index].detail.c_str());
+					draw->AddText(font, 17 * scale, point(x + 22, y + 210), muted, setting.help, nullptr, (card_w - 44) * scale);
+					text(x + 22, y + card_h - 22, 16, faint, "X: cambiar");
+				}
+				else if (s_items[index].path == BiosEntryPath)
 				{
 					text(x + 24, y + card_h - 74, 24, white, "Menú de PS2");
 					text(x + 24, y + card_h - 40, 17, muted, "Iniciar BIOS sin disco");
@@ -1480,7 +1600,7 @@ namespace PS4GameMenu
 		if (!disc_view)
 		{
 			image("controle_quadrado", 500, 1001, 30, 30);
-			text(538, 1023, 16, current.path.empty() || current.path == BiosEntryPath ? muted : white,
+			text(538, 1023, 16, current.path.empty() || current.path == BiosEntryPath || IsSettingPath(current.path) ? muted : white,
 				current.favorite ? "Remove favorite" : "Add favorite");
 		}
 		// Disc has no favorite action: use the next Library slots without an empty gap.
