@@ -1,0 +1,66 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID de la compilación (Build PS4SX2) cuyo pkg se publica'
+        required: true
+        default: '45072141244'
+      artifact:
+        description: 'Nombre del artefacto con el pkg'
+        required: true
+        default: 'PS4SX2-PKG-1'
+      tag:
+        description: 'Etiqueta del Release'
+        required: true
+        default: 'v01.00-menu-bios'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Descargar el pkg compilado
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n "${{ inputs.artifact }}" -D pkg
+          find pkg -type f -exec ls -la {} \;
+
+      - name: Escribir la descripción
+        run: |
+          cat > notes.md <<'NOTES'
+          # PS4SX2 Emu – versión con Menú de PS2 (BIOS)
+
+          Fork no oficial de [PS4SX2](https://github.com/Phoenixx1202/PS4SX2) de Phoenixx1202, basado en el emulador [PCSX2](https://github.com/PCSX2/pcsx2).
+
+          **Cambio respecto al original (22/11/2026):** nueva tarjeta "Menú de PS2" en la Biblioteca que arranca la BIOS sin disco para usar el menú original de la PS2 (reloj, tarjetas de memoria, configuración).
+
+          **Requisitos:** PS4 con GoldHEN y la BIOS de tu propia PS2 en `/data/PS4SX2/bios`. No se incluyen BIOS, juegos ni claves.
+
+          **Instalación:** descarga el `.pkg` de abajo, cópialo a un USB (exFAT o FAT32) e instálalo desde Ajustes → Debug Settings → Game → Package Installer.
+
+          **Estado:** experimental. Algunos juegos pueden fallar o ir lentos.
+
+          **Créditos:** equipo de PCSX2, Phoenixx1202 (PS4SX2), Al-Azif (ps-disc-detect), Spyros, colaboradores de DolphinPS4 y love-ps4, OpenOrbis, Mesa, Khronos y los autores de las librerías de `3rdparty/`.
+
+          **Licencia:** GPL-3.0. El código fuente es este repositorio.
+
+          Proyecto independiente. No está afiliado a Sony ni respaldado por el equipo de PCSX2. PlayStation, PS2 y PS4 son marcas de Sony Interactive Entertainment.
+          NOTES
+
+      - name: Crear el Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t files < <(find pkg -type f)
+          gh release create "${{ inputs.tag }}" "${files[@]}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --title "PS4SX2 Emu 01.00 – con Menú de PS2 (BIOS)" \
+            --notes-file notes.md
