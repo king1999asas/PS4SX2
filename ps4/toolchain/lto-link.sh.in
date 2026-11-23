@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# (fork) ThinLTO link in two steps. ld.lld-21 runs LTO on the clang 21 bitcode
+# objects and writes one native relocatable object; the SDK's ld.lld 12 then does
+# the final link as in the normal build, so create-fself sees the same ELF layout
+# (ld.lld-21's own layout makes create-fself duplicate the data PT_LOAD).
+set -euo pipefail
+final_linker='@PCSX2_VM_FINAL_LINKER@'
+lto_linker='@PCSX2_VM_LTO_LINKER@'
+args=()
+bitcode=()
+out=''
+prev=''
+lto_slot=-1
+for arg in "$@"; do
+  if [[ "$prev" == '-o' ]]; then
+    out="$arg"
+  fi
+  prev="$arg"
+  if [[ "$arg" == *.obj || "$arg" == *.o ]] && [[ -f "$arg" ]] &&
+     [[ "$(head -c 4 "$arg" | od -An -tx1 | tr -d ' \n')" == '4243c0de' ]]; then
+    bitcode+=("$arg")
+    if (( lto_slot < 0 )); then
+      lto_slot=${#args[@]}
+      args+=('__LTO_OBJECT__')
+    fi
+  else
+    args+=("$arg")
+  fi
+done
+if (( ${#bitcode[@]} > 0 )); then
+  lto_object="${out:-a.out}.lto.o"
+  echo "PS4SX2 ThinLTO: ${#bitcode[@]} bitcode objects -> ${lto_object}"
+  "$lto_linker" -r --lto-O3 -o "$lto_object" "${bitcode[@]}"
+  args[$lto_slot]="$lto_object"
+fi
+exec "$final_linker" "${args[@]}"

@@ -323,6 +323,21 @@ target_compile_definitions(vm_boot PRIVATE PCSX2_PS4=1 PCSX2_PS4_VM_BOOT=1 PS4=1
 target_compile_options(vm_boot PRIVATE -march=btver2 -msse4.1 -mno-avx2 -mno-bmi2 -ffunction-sections -fdata-sections -fvisibility=hidden
   "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include compare>" "SHELL:-include strings.h")
 target_link_options(vm_boot PRIVATE --gc-sections --error-limit=0)
+# (fork) Experimental ThinLTO. The OpenOrbis ld.lld 12 cannot read clang 21
+# bitcode: ld.lld-21 performs LTO into one relocatable object and ld.lld 12
+# still does the final link (toolchain/lto-link.sh.in), keeping the ELF layout
+# that create-fself handles. Build with PCSX2_VM_LTO=OFF to disable.
+option(PCSX2_VM_LTO "Experimental ThinLTO (ld.lld-21 LTO, ld.lld 12 final link)" ON)
+if(PCSX2_VM_LTO)
+  find_program(PCSX2_VM_LTO_LINKER NAMES ld.lld-21 HINTS /usr/bin /usr/lib/llvm-21/bin REQUIRED)
+  set(PCSX2_VM_FINAL_LINKER "${CMAKE_LINKER}")
+  configure_file("${CMAKE_CURRENT_LIST_DIR}/../toolchain/lto-link.sh.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/lto-link.sh" @ONLY
+    FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+  message(STATUS "PS4SX2 ThinLTO: LTO with ${PCSX2_VM_LTO_LINKER}, final link with ${PCSX2_VM_FINAL_LINKER}")
+  set(CMAKE_LINKER "${CMAKE_CURRENT_BINARY_DIR}/lto-link.sh")
+  target_compile_options(vm_boot PRIVATE -flto=thin)
+endif()
 ps4_link_mesa(vm_boot)
 target_link_libraries(vm_boot PRIVATE glslang glslang-default-resource-limits ryml ps4_audio_resampler ps4_chd
   png jpeg webp z ${PCSX2_ROOT}/ps4/deps/prefix/lib/libzstd.a ${PCSX2_ROOT}/ps4/deps/prefix/lib/liblz4.a

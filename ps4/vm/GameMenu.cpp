@@ -374,7 +374,7 @@ namespace PS4GameMenu
 		// Settings view. Each option is stored as the marker files that main.cpp
 		// reads, so it applies to the next game started from the launcher.
 		constexpr const char* SettingPrefix = "ps4sx2://setting/";
-		constexpr size_t SettingCount = 9;
+		constexpr size_t SettingCount = 10;
 		struct LauncherSetting
 		{
 			const char* name;
@@ -386,9 +386,9 @@ namespace PS4GameMenu
 			{"Perfil de rendimiento", "Cambia varios ajustes a la vez. Máximo rendimiento quita lag pero puede dar fallos gráficos.",
 				{"Compatible", "Recomendado", "Máximo rendimiento", "Personalizado"}, 3},
 			{"Carga de CPU (EE)", "Menos carga = menos lag en juegos pesados. Si un juego va lento o raro, prueba otro nivel.",
-				{"Normal (100%)", "Reducida (75%)", "Muy reducida (60%)"}, 3},
+				{"Normal (100%)", "Reducida (75%)", "Muy reducida (60%)", "Mínima (50%)"}, 4},
 			{"Saltar ciclos EE", "Gana velocidad en juegos lentos. Puede causar fallos en algunos juegos.",
-				{"No", "Nivel 1", "Nivel 2"}, 3},
+				{"No", "Nivel 1", "Nivel 2", "Nivel 3"}, 4},
 			{"Carga rápida de disco", "Acorta las cargas. Algunos juegos se cuelgan con esto activado.",
 				{"No", "Sí"}, 2},
 			{"JIT rápido", "Más velocidad de CPU. Puede romper juegos como GTA San Andreas.",
@@ -401,6 +401,8 @@ namespace PS4GameMenu
 				{"Saltar", "Mostrar"}, 2},
 			{"Sonido", "Desactivarlo ahorra algo de CPU en juegos muy pesados.",
 				{"Activado", "Desactivado"}, 2},
+			{"Prioridad de hilos", "Alta evita que el sistema frene al emulador. Se aplica al volver a abrir PS4SX2.",
+				{"Alta", "Normal"}, 2},
 		};
 		// Values of settings 1..6 for each profile (Compatible, Recommended, Maximum).
 		constexpr unsigned ProfileValues[3][6] = {
@@ -445,14 +447,19 @@ namespace PS4GameMenu
 							return profile;
 					}
 					return 3;
-				case 1: return Marker("vm-ee-cycle-normal") ? 0u : Marker("vm-ee-cycle-underclock") ? 2u : 1u;
-				case 2: return Marker("vm-ee-cycle-skip2") ? 2u : Marker("vm-ee-cycle-skip") ? 1u : 0u;
+				case 1:
+					return Marker("vm-ee-cycle-normal") ? 0u : Marker("vm-ee-cycle-minimum") ? 3u :
+					       Marker("vm-ee-cycle-underclock") ? 2u : 1u;
+				case 2:
+					return Marker("vm-ee-cycle-skip3") ? 3u : Marker("vm-ee-cycle-skip2") ? 2u :
+					       Marker("vm-ee-cycle-skip") ? 1u : 0u;
 				case 3: return Marker("vm-fast-cdvd") && !Marker("vm-no-fast-cdvd") ? 1u : 0u;
 				case 4: return Marker("vm-skip-smc") ? 1u : 0u;
 				case 5: return Marker("vm-gpu-readback-off") ? 2u : Marker("vm-gpu-readback-unsync") ? 1u : 0u;
 				case 6: return Marker("vm-blend-minimum") ? 1u : 0u;
 				case 7: return Marker("vm-no-fast-boot") ? 1u : 0u;
-				default: return Marker("vm-no-audio") ? 1u : 0u;
+				case 8: return Marker("vm-no-audio") ? 1u : 0u;
+				default: return Marker("vm-no-thread-priority") ? 1u : 0u;
 			}
 		}
 		void SetSetting(size_t id, unsigned value)
@@ -467,10 +474,12 @@ namespace PS4GameMenu
 					SetMarker("vm-ee-cycle-mild", false);
 					SetMarker("vm-ee-cycle-normal", value == 0);
 					SetMarker("vm-ee-cycle-underclock", value == 2);
+					SetMarker("vm-ee-cycle-minimum", value == 3);
 					break;
 				case 2:
 					SetMarker("vm-ee-cycle-skip", value == 1);
 					SetMarker("vm-ee-cycle-skip2", value == 2);
+					SetMarker("vm-ee-cycle-skip3", value == 3);
 					break;
 				case 3:
 					SetMarker("vm-no-fast-cdvd", false);
@@ -483,7 +492,8 @@ namespace PS4GameMenu
 					break;
 				case 6: SetMarker("vm-blend-minimum", value == 1); break;
 				case 7: SetMarker("vm-no-fast-boot", value == 1); break;
-				default: SetMarker("vm-no-audio", value == 1); break;
+				case 8: SetMarker("vm-no-audio", value == 1); break;
+				default: SetMarker("vm-no-thread-priority", value == 1); break;
 			}
 		}
 
@@ -1135,7 +1145,8 @@ namespace PS4GameMenu
 					const unsigned value = (GetSetting(id) + 1) % LauncherSettings[id].count;
 					SetSetting(id, value);
 					status = std::string(LauncherSettings[id].name) + ": " + LauncherSettings[id].values[value] +
-					         ". Se aplica al iniciar el próximo juego.";
+					         (id == SettingCount - 1 ? ". Se aplica al volver a abrir PS4SX2." :
+					                                   ". Se aplica al iniciar el próximo juego.");
 					if (id == 0)
 						status += " Los demás ajustes se han actualizado.";
 					ProbeLog("Game menu: setting %s -> %s\n", LauncherSettings[id].name, LauncherSettings[id].values[value]);
