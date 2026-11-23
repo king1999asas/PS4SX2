@@ -39,6 +39,27 @@ static const s32 tbl_XA_Factor[16][2] =
 		{98, -55},
 		{122, -60}};
 
+// IRQ address/enable of both cores, captured once per mixed sample. Nothing inside
+// spu2Mix changes them (SetIrqCall only raises the IOP interrupt), so checking the
+// snapshot gives the same results as re-reading Cores[] for every voice.
+// A disabled core gets an address no SPU2 RAM access can match (all are < 0x100000).
+static constexpr u32 NoMixIrqAddress = 0xFFFFFFFFu;
+static u32 s_mix_irq_address[2] = {NoMixIrqAddress, NoMixIrqAddress};
+
+static __forceinline void CaptureMixIrqState()
+{
+	s_mix_irq_address[0] = Cores[0].IRQEnable ? Cores[0].IRQA : NoMixIrqAddress;
+	s_mix_irq_address[1] = Cores[1].IRQEnable ? Cores[1].IRQA : NoMixIrqAddress;
+}
+
+static __forceinline void CheckMixIrq(u32 addr)
+{
+	if (s_mix_irq_address[0] == addr) [[unlikely]]
+		SetIrqCall(0);
+	if (s_mix_irq_address[1] == addr) [[unlikely]]
+		SetIrqCall(1);
+}
+
 static void __forceinline XA_decode_block(s16* buffer, const s16* block, s32& prev1, s32& prev2)
 {
 	const s32 header = *block;
@@ -77,17 +98,7 @@ static void __forceinline IncrementNextA(V_Core& thiscore, uint voiceidx)
 
 	// Important!  Both cores signal IRQ when an address is read, regardless of
 	// which core actually reads the address.
-
-	for (int i = 0; i < 2; i++)
-	{
-		if (Cores[i].IRQEnable && (vc.NextA == Cores[i].IRQA))
-		{
-			//if( IsDevBuild )
-			//	ConLog(" * SPU2 Core %d: IRQ Requested (IRQA (%05X) passed; voice %d).\n", i, Cores[i].IRQA, thiscore.Index * 24 + voiceidx);
-
-			SetIrqCall(i);
-		}
-	}
+	CheckMixIrq(vc.NextA);
 
 	vc.NextA++;
 	vc.NextA &= 0xFFFFF;
@@ -175,9 +186,7 @@ static __forceinline void UpdateBlockHeader(V_Core& thiscore, uint voiceidx)
 {
 	V_Voice& vc(thiscore.Voices[voiceidx]);
 
-	for (int i = 0; i < 2; i++)
-		if (Cores[i].IRQEnable && Cores[i].IRQA == (vc.NextA & 0xFFFF8))
-			SetIrqCall(i);
+	CheckMixIrq(vc.NextA & 0xFFFF8);
 
 	s16* memptr = GetMemPtr(vc.NextA & 0xFFFF8);
 	vc.LoopFlags = *memptr >> 8; // grab loop flags from the upper byte.
@@ -352,14 +361,7 @@ static __forceinline s32 GetNoiseValues(V_Core& thiscore)
 static __forceinline void spu2M_WriteFast(u32 addr, s16 value)
 {
 	// Fixes some of the oldest hangs in pcsx2's history! :p
-	for (int i = 0; i < 2; i++)
-	{
-		if (Cores[i].IRQEnable && Cores[i].IRQA == addr)
-		{
-			//printf("Core %d special write IRQ Called (IRQ passed). IRQA = %x\n",i,addr);
-			SetIrqCall(i);
-		}
-	}
+	CheckMixIrq(addr);
 // throw an assertion if the memory range is invalid:
 #ifndef DEBUG_FAST
 	pxAssume(addr < SPU2_DYN_MEMLINE);
@@ -377,7 +379,10 @@ static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
 	// methods when needed by checking the flag outside the method here...
 	// (Note: Ys 6 : Ark of Nephistm uses these effects)
 
-	vc.Volume.Update();
+	if (vc.Volume.Left.Enable)
+		vc.Volume.Left.Update();
+	if (vc.Volume.Right.Enable)
+		vc.Volume.Right.Update();
 
 	DecodeSamples(coreidx, voiceidx);
 
@@ -426,7 +431,11 @@ static __forceinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 
 	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 	{
+		const bool audible = thiscore.Voices[voiceidx].ADSR.Phase > V_ADSR::PHASE_STOPPED;
 		StereoOut32 VVal(MixVoice(coreidx, voiceidx));
+		// A voice that was stopped when mixing began returns silence (0, 0).
+		if (!audible)
+			continue;
 
 		// Note: Results from MixVoice are ranged at 16 bits.
 
@@ -441,7 +450,10 @@ static __forceinline StereoOut32 MixCore(const uint coreidx, const VoiceMixSet& 
 {
 	V_Core& thiscore(Cores[coreidx]);
 
-	thiscore.MasterVol.Update();
+	if (thiscore.MasterVol.Left.Enable)
+		thiscore.MasterVol.Left.Update();
+	if (thiscore.MasterVol.Right.Enable)
+		thiscore.MasterVol.Right.Update();
 	UpdateNoise(thiscore);
 
 	// Saturate final result to standard 16 bit range.
@@ -540,6 +552,8 @@ void spu2Mix()
 
 	// Todo: Replace me with memzero initializer!
 	VoiceMixSet VoiceData[2] = {{StereoOut32(), StereoOut32()}, {StereoOut32(), StereoOut32()}}; // mixed voice data for each core.
+
+	CaptureMixIrqState();
 
 	MixCoreVoices(VoiceData[0], 0);
 	MixCoreVoices(VoiceData[1], 1);
