@@ -18,6 +18,7 @@
 #include "SPU2/spu2.h"
 
 #include "common/Console.h"
+#include "ps4/core/WorkerProfilePS4.h"
 
 s16 spu2regs[0x010000 / sizeof(s16)];
 s16 _spu2mem[0x200000 / sizeof(s16)];
@@ -324,6 +325,9 @@ __forceinline void TimeUpdate(u64 cClocks)
 
 	if (dClocks > (u32)-15)
 		return;
+
+	// PS4 diagnostic (off unless enabled): time spent mixing SPU2 audio on the EE thread.
+	PS4_WORKER_SCOPE(EESPU2);
 
 	//  But if for some reason our clock value seems way off base (typically due to bad dma
 	//  timings from PCSX2), just mix out a little bit, skip the rest, and hope the ship
