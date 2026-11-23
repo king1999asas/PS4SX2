@@ -31,6 +31,13 @@ static bool s_psxmode = false;
 static bool s_output_muted = false;
 
 static std::unique_ptr<AudioStream> s_output_stream;
+static bool s_null_output = false;
+bool SPU2SilentMix = false;
+
+static void UpdateSilentMix()
+{
+	SPU2SilentMix = s_null_output && !s_audio_capture_active;
+}
 static std::array<float, AudioStream::CHUNK_SIZE * 2> s_current_chunk;
 static u32 s_current_chunk_pos;
 static u32 s_standard_volume = 0;
@@ -117,6 +124,7 @@ void SPU2::CreateOutputStream()
 	s_output_stream.reset();
 
 	Error error;
+	s_null_output = (EmuConfig.SPU2.Backend == AudioBackend::Null);
 	s_output_stream = AudioStream::CreateStream(EmuConfig.SPU2.Backend, sample_rate, EmuConfig.SPU2.StreamParameters,
 		EmuConfig.SPU2.DriverName.c_str(), EmuConfig.SPU2.DeviceName.c_str(), EmuConfig.SPU2.IsTimeStretchEnabled(), &error);
 	if (!s_output_stream)
@@ -126,7 +134,9 @@ void SPU2::CreateOutputStream()
 				error.GetDescription()));
 
 		s_output_stream = AudioStream::CreateNullStream(sample_rate, EmuConfig.SPU2.StreamParameters.buffer_ms);
+		s_null_output = true;
 	}
+	UpdateSilentMix();
 
 	SPU2::UpdateOutputVolume();
 	s_output_stream->SetNominalRate(GetNominalRate());
@@ -218,6 +228,7 @@ void SPU2::SetOutputPaused(bool paused)
 void SPU2::SetAudioCaptureActive(bool active)
 {
 	s_audio_capture_active = active;
+	UpdateSilentMix();
 }
 
 bool SPU2::IsAudioCaptureActive()
