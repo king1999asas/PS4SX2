@@ -74,12 +74,29 @@ StereoOut32 V_Core::DoReverb(StereoOut32 Input)
 		return StereoOut32::Empty;
 	}
 
-	Input = clamp_mix(Input);
+	// Silent mixing (no audio output): only the IRQs the reverb buffer accesses
+	// can raise matter to the game, so skip the filters and the reverb itself.
+	const bool silent = SPU2SilentMix;
+	if (silent)
+	{
+		bool irq_possible = false;
+		for (int i = 0; i < 2; i++)
+			irq_possible |= FxEnable && Cores[i].IRQEnable && (Cores[i].IRQA >= EffectsStartA) && (Cores[i].IRQA <= EffectsEndA);
+		if (!irq_possible)
+		{
+			RevbSampleBufPos = (RevbSampleBufPos + 1) & 63;
+			return StereoOut32::Empty;
+		}
+	}
+	else
+	{
+		Input = clamp_mix(Input);
 
-	RevbDownBuf[0][RevbSampleBufPos] = Input.Left;
-	RevbDownBuf[1][RevbSampleBufPos] = Input.Right;
-	RevbDownBuf[0][RevbSampleBufPos | 64] = Input.Left;
-	RevbDownBuf[1][RevbSampleBufPos | 64] = Input.Right;
+		RevbDownBuf[0][RevbSampleBufPos] = Input.Left;
+		RevbDownBuf[1][RevbSampleBufPos] = Input.Right;
+		RevbDownBuf[0][RevbSampleBufPos | 64] = Input.Left;
+		RevbDownBuf[1][RevbSampleBufPos | 64] = Input.Right;
+	}
 
 	bool R = Cycles & 1;
 
@@ -130,6 +147,12 @@ StereoOut32 V_Core::DoReverb(StereoOut32 Input)
 				SetIrqCall(i);
 			}
 		}
+	}
+
+	if (silent)
+	{
+		RevbSampleBufPos = (RevbSampleBufPos + 1) & 63;
+		return StereoOut32::Empty;
 	}
 
 	// Reverb algorithm pretty much directly ripped from http://drhell.web.fc2.com/ps1/
