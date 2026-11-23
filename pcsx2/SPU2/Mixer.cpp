@@ -197,7 +197,9 @@ static __forceinline void UpdateBlockHeader(V_Core& thiscore, uint voiceidx)
 	}
 }
 
-static __forceinline void DecodeSamples(uint coreidx, uint voiceidx)
+// decode=false (silent mixing): keep every address, loop flag and IRQ the game can
+// see, but skip the ADPCM decode whose samples would only feed the speakers.
+static __forceinline void DecodeSamples(uint coreidx, uint voiceidx, bool decode)
 {
 	V_Core& thiscore(Cores[coreidx]);
 	V_Voice& vc(thiscore.Voices[voiceidx]);
@@ -212,7 +214,7 @@ static __forceinline void DecodeSamples(uint coreidx, uint voiceidx)
 		return;
 	}
 
-	if (vc.ADSR.Phase > V_ADSR::PHASE_STOPPED)
+	if (decode && vc.ADSR.Phase > V_ADSR::PHASE_STOPPED)
 	{
 		GetNextDataBuffered(thiscore, voiceidx);
 	}
@@ -370,7 +372,10 @@ static __forceinline void spu2M_WriteFast(u32 addr, s16 value)
 }
 
 
-static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
+// full=false (silent mixing, and the next voice does not use this one for pitch
+// modulation): the envelope, pitch, addresses and IRQs advance exactly as usual,
+// but the sample value is not computed.
+static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx, bool full)
 {
 	V_Core& thiscore(Cores[coreidx]);
 	V_Voice& vc(thiscore.Voices[voiceidx]);
@@ -384,14 +389,16 @@ static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
 	if (vc.Volume.Right.Enable)
 		vc.Volume.Right.Update();
 
-	DecodeSamples(coreidx, voiceidx);
+	DecodeSamples(coreidx, voiceidx, full);
 
 	StereoOut32 voiceOut(0, 0);
 	s32 Value = 0;
 
 	if (vc.ADSR.Phase > V_ADSR::PHASE_STOPPED)
 	{
-		if (vc.Noise)
+		if (!full)
+			Value = 0;
+		else if (vc.Noise)
 			Value = GetNoiseValues(thiscore);
 		else
 			Value = GetVoiceValues(thiscore, voiceidx);
@@ -405,7 +412,8 @@ static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
 		if (IsDevBuild)
 			DebugCores[coreidx].Voices[voiceidx].displayPeak = std::max(DebugCores[coreidx].Voices[voiceidx].displayPeak, (s32)vc.OutX);
 
-		voiceOut = ApplyVolume(StereoOut32(Value, Value), vc.Volume);
+		if (full)
+			voiceOut = ApplyVolume(StereoOut32(Value, Value), vc.Volume);
 	}
 
 	// SPU2 Note: The spu2 continues to process voices for eternity, always, so we
@@ -428,13 +436,18 @@ static __forceinline StereoOut32 MixVoice(uint coreidx, uint voiceidx)
 static __forceinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 {
 	V_Core& thiscore(Cores[coreidx]);
+	const bool silent = SPU2SilentMix;
 
 	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 	{
 		const bool audible = thiscore.Voices[voiceidx].ADSR.Phase > V_ADSR::PHASE_STOPPED;
-		StereoOut32 VVal(MixVoice(coreidx, voiceidx));
+		// With silent mixing a voice still needs its real output when the next
+		// voice is pitch-modulated by it (that changes how fast the next one reads).
+		const bool full = !silent ||
+		                  (voiceidx + 1 < V_Core::NumVoices && thiscore.Voices[voiceidx + 1].Modulated);
+		StereoOut32 VVal(MixVoice(coreidx, voiceidx, full));
 		// A voice that was stopped when mixing began returns silence (0, 0).
-		if (!audible)
+		if (!audible || silent)
 			continue;
 
 		// Note: Results from MixVoice are ranged at 16 bits.
@@ -596,7 +609,8 @@ void spu2Mix()
 	WaveDump::WriteCore(1, CoreSrc_External, Out);
 #endif
 
-	spu2Output(Out);
+	if (!SPU2SilentMix)
+		spu2Output(Out);
 
 	// Update AutoDMA output positioning
 	OutPos++;
