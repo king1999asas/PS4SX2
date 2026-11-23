@@ -610,13 +610,29 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 	settings->SetBoolValue("EmuCore", "EnableFastBootFastForward", fast_boot);
 	const bool audio_enabled = access("/data/PS4SX2/vm-no-audio", F_OK) != 0;
 	settings->SetStringValue("SPU2/Output", "Backend", audio_enabled ? "Cubeb" : "Null");
+	// GPU readbacks stall the EE thread while the GPU finishes; unsynchronized or
+	// disabled readbacks trade some effects for fewer hitches.
+	const int download_mode = access("/data/PS4SX2/vm-gpu-readback-off", F_OK) == 0 ?
+	                              static_cast<int>(GSHardwareDownloadMode::Disabled) :
+	                          access("/data/PS4SX2/vm-gpu-readback-unsync", F_OK) == 0 ?
+	                              static_cast<int>(GSHardwareDownloadMode::Unsynchronized) : -1;
+	if (download_mode >= 0)
+		settings->SetIntValue("EmuCore/GS", "HWDownloadMode", download_mode);
+	else
+		settings->DeleteValue("EmuCore/GS", "HWDownloadMode");
+	const bool minimum_blending = access("/data/PS4SX2/vm-blend-minimum", F_OK) == 0;
+	if (minimum_blending)
+		settings->SetIntValue("EmuCore/GS", "accurate_blending_unit", static_cast<int>(AccBlendLevel::Minimum));
+	else
+		settings->DeleteValue("EmuCore/GS", "accurate_blending_unit");
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 	g_ps4_skip_smc_checks = access("/data/PS4SX2/vm-skip-smc", F_OK) == 0;
 	g_ps4_bytecopy_fusion = g_ps4_skip_smc_checks && access("/data/PS4SX2/vm-no-bytecopy-fusion", F_OK) != 0;
 #endif
 	VMManager::ApplySettings();
-	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d\n",
-		ee_cycle_rate, ee_cycle_skip, fast_cdvd ? 1 : 0, fast_boot ? 1 : 0, audio_enabled ? 1 : 0);
+	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d readback=%d minBlend=%d\n",
+		ee_cycle_rate, ee_cycle_skip, fast_cdvd ? 1 : 0, fast_boot ? 1 : 0, audio_enabled ? 1 : 0, download_mode,
+		minimum_blending ? 1 : 0);
 }
 
 static void* RunVM(void*)
