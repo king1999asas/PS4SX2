@@ -374,15 +374,17 @@ namespace PS4GameMenu
 		// Settings view. Each option is stored as the marker files that main.cpp
 		// reads, so it applies to the next game started from the launcher.
 		constexpr const char* SettingPrefix = "ps4sx2://setting/";
-		constexpr size_t SettingCount = 6;
+		constexpr size_t SettingCount = 9;
 		struct LauncherSetting
 		{
 			const char* name;
 			const char* help;
-			const char* values[3];
-			unsigned count;
+			const char* values[4];
+			unsigned count; // selectable values; a 4th value is display-only
 		};
 		constexpr LauncherSetting LauncherSettings[SettingCount] = {
+			{"Perfil de rendimiento", "Cambia varios ajustes a la vez. Máximo rendimiento quita lag pero puede dar fallos gráficos.",
+				{"Compatible", "Recomendado", "Máximo rendimiento", "Personalizado"}, 3},
 			{"Carga de CPU (EE)", "Menos carga = menos lag en juegos pesados. Si un juego va lento o raro, prueba otro nivel.",
 				{"Normal (100%)", "Reducida (75%)", "Muy reducida (60%)"}, 3},
 			{"Saltar ciclos EE", "Gana velocidad en juegos lentos. Puede causar fallos en algunos juegos.",
@@ -391,10 +393,20 @@ namespace PS4GameMenu
 				{"No", "Sí"}, 2},
 			{"JIT rápido", "Más velocidad de CPU. Puede romper juegos como GTA San Andreas.",
 				{"No", "Sí"}, 2},
+			{"Lecturas de GPU", "Quita tirones cuando el juego lee la pantalla. Puede fallar algún efecto.",
+				{"Precisas", "Sin sincronizar", "Desactivadas"}, 3},
+			{"Precisión de mezcla", "Mínima alivia la GPU; algunas transparencias pueden verse peor.",
+				{"Básica", "Mínima"}, 2},
 			{"Intro de la BIOS", "Al iniciar un juego, salta o muestra la animación de la PS2.",
 				{"Saltar", "Mostrar"}, 2},
 			{"Sonido", "Desactivarlo ahorra algo de CPU en juegos muy pesados.",
 				{"Activado", "Desactivado"}, 2},
+		};
+		// Values of settings 1..6 for each profile (Compatible, Recommended, Maximum).
+		constexpr unsigned ProfileValues[3][6] = {
+			{0, 0, 0, 0, 0, 0},
+			{1, 0, 0, 0, 0, 0},
+			{2, 1, 1, 0, 1, 1},
 		};
 		bool Marker(const char* name)
 		{
@@ -423,11 +435,23 @@ namespace PS4GameMenu
 		{
 			switch (id)
 			{
-				case 0: return Marker("vm-ee-cycle-normal") ? 0u : Marker("vm-ee-cycle-underclock") ? 2u : 1u;
-				case 1: return Marker("vm-ee-cycle-skip2") ? 2u : Marker("vm-ee-cycle-skip") ? 1u : 0u;
-				case 2: return Marker("vm-fast-cdvd") && !Marker("vm-no-fast-cdvd") ? 1u : 0u;
-				case 3: return Marker("vm-skip-smc") ? 1u : 0u;
-				case 4: return Marker("vm-no-fast-boot") ? 1u : 0u;
+				case 0:
+					for (unsigned profile = 0; profile < 3; ++profile)
+					{
+						bool match = true;
+						for (size_t i = 0; i < 6 && match; ++i)
+							match = GetSetting(i + 1) == ProfileValues[profile][i];
+						if (match)
+							return profile;
+					}
+					return 3;
+				case 1: return Marker("vm-ee-cycle-normal") ? 0u : Marker("vm-ee-cycle-underclock") ? 2u : 1u;
+				case 2: return Marker("vm-ee-cycle-skip2") ? 2u : Marker("vm-ee-cycle-skip") ? 1u : 0u;
+				case 3: return Marker("vm-fast-cdvd") && !Marker("vm-no-fast-cdvd") ? 1u : 0u;
+				case 4: return Marker("vm-skip-smc") ? 1u : 0u;
+				case 5: return Marker("vm-gpu-readback-off") ? 2u : Marker("vm-gpu-readback-unsync") ? 1u : 0u;
+				case 6: return Marker("vm-blend-minimum") ? 1u : 0u;
+				case 7: return Marker("vm-no-fast-boot") ? 1u : 0u;
 				default: return Marker("vm-no-audio") ? 1u : 0u;
 			}
 		}
@@ -436,20 +460,29 @@ namespace PS4GameMenu
 			switch (id)
 			{
 				case 0:
+					for (size_t i = 0; i < 6; ++i)
+						SetSetting(i + 1, ProfileValues[std::min(value, 2u)][i]);
+					break;
+				case 1:
 					SetMarker("vm-ee-cycle-mild", false);
 					SetMarker("vm-ee-cycle-normal", value == 0);
 					SetMarker("vm-ee-cycle-underclock", value == 2);
 					break;
-				case 1:
+				case 2:
 					SetMarker("vm-ee-cycle-skip", value == 1);
 					SetMarker("vm-ee-cycle-skip2", value == 2);
 					break;
-				case 2:
+				case 3:
 					SetMarker("vm-no-fast-cdvd", false);
 					SetMarker("vm-fast-cdvd", value == 1);
 					break;
-				case 3: SetMarker("vm-skip-smc", value == 1); break;
-				case 4: SetMarker("vm-no-fast-boot", value == 1); break;
+				case 4: SetMarker("vm-skip-smc", value == 1); break;
+				case 5:
+					SetMarker("vm-gpu-readback-unsync", value == 1);
+					SetMarker("vm-gpu-readback-off", value == 2);
+					break;
+				case 6: SetMarker("vm-blend-minimum", value == 1); break;
+				case 7: SetMarker("vm-no-fast-boot", value == 1); break;
 				default: SetMarker("vm-no-audio", value == 1); break;
 			}
 		}
@@ -494,7 +527,7 @@ namespace PS4GameMenu
 				for (size_t id = 0; id < SettingCount; ++id)
 				{
 					Item item{LauncherSettings[id].name, std::string(SettingPrefix) + std::to_string(id), {}, false};
-					item.detail = LauncherSettings[id].values[std::min(GetSetting(id), LauncherSettings[id].count - 1)];
+					item.detail = LauncherSettings[id].values[std::min(GetSetting(id), id == 0 ? 3u : LauncherSettings[id].count - 1)];
 					item.name = std::string(LauncherSettings[id].name) + ": " + item.detail;
 					items.push_back(std::move(item));
 				}
@@ -1103,6 +1136,8 @@ namespace PS4GameMenu
 					SetSetting(id, value);
 					status = std::string(LauncherSettings[id].name) + ": " + LauncherSettings[id].values[value] +
 					         ". Se aplica al iniciar el próximo juego.";
+					if (id == 0)
+						status += " Los demás ajustes se han actualizado.";
 					ProbeLog("Game menu: setting %s -> %s\n", LauncherSettings[id].name, LauncherSettings[id].values[value]);
 					items = BuildView(library, view, favorites, recent);
 					Publish(items, view);
