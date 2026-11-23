@@ -11,7 +11,9 @@ extern void ProbeLog(const char*, ...);
 
 namespace PS4WorkerProfile
 {
-	enum Kind { VUExecute, VUUnpack, VUIdle, GSWaitVU, GSTransfer, Count };
+	// EEIOP and EESPU2 are produced by the EE thread (IOP slices and SPU2 mixing;
+	// SPU2 mixing called from IOP code is also inside the IOP slice time).
+	enum Kind { VUExecute, VUUnpack, VUIdle, GSWaitVU, GSTransfer, EEIOP, EESPU2, Count };
 	inline std::atomic<bool> enabled{false};
 	struct Counter
 	{
@@ -57,7 +59,8 @@ namespace PS4WorkerProfile
 	{
 		if (!enabled.load(std::memory_order_relaxed))
 			return;
-		constexpr const char* names[] = {"vu_execute", "vu_unpack", "vu_wait_work", "gs_wait_vu", "gs_gif_transfer"};
+		constexpr const char* names[] = {"vu_execute", "vu_unpack", "vu_wait_work", "gs_wait_vu", "gs_gif_transfer",
+			"ee_iop_slice", "ee_spu2_mix"};
 		for (unsigned i = 0; i < Count; ++i)
 		{
 			auto& c = counters[i];
