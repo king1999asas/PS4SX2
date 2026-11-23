@@ -810,6 +810,62 @@ namespace PS4GameMenu
 			ProbeLog("Settings v2: image options removed from %u game profiles, %u frame-rate patches disabled, diagnostics off\n",
 				profiles, patches);
 		}
+
+		// Game-specific performance patches shipped with the emulator. Each is
+		// written to the patches folder if missing and switched on once for its
+		// game (it can then be turned off in Trucos like any other patch).
+		struct BundledPatch
+		{
+			const char* serial;
+			const char* file;
+			const char* name;
+			const char* text;
+			const char* enabled_marker;
+		};
+		constexpr BundledPatch BundledPatches[] = {
+			{"SLES-55016", "SLES-55016_9D6AA1B8_rendimiento.pnach", "Rendimiento: sin sombras proyectadas",
+				"gametitle=DreamWorks Bee Movie Game (PAL) [SLES-55016] (9D6AA1B8)\n"
+				"\n"
+				"[Rendimiento: sin sombras proyectadas]\n"
+				"author=PS4SX2 (experimental)\n"
+				"description=Desactiva las proyecciones sobre el suelo y las paredes (probablemente las sombras de personajes y coches). Libera CPU en zonas abiertas con trafico.\n"
+				"// 0x203140 projects each nearby object onto the scenery (transforms and clips the\n"
+				"// surrounding triangles, then draws the result). It allocates and frees its own\n"
+				"// scratch memory, so returning at entry skips the whole effect cleanly.\n"
+				"// Original: addiu sp,sp,-0x190 / lui v0,0x43  ->  jr ra / nop\n"
+				"patch=1,EE,00203140,word,03e00008\n"
+				"patch=1,EE,00203144,word,00000000\n",
+				"bundled-bee-shadows-v1"},
+		};
+		void InstallBundledPatches()
+		{
+			mkdir(PatchesDirectory, 0777);
+			for (const BundledPatch& patch : BundledPatches)
+			{
+				const std::string path = std::string(PatchesDirectory) + "/" + patch.file;
+				if (access(path.c_str(), F_OK) != 0)
+				{
+					if (FILE* file = std::fopen(path.c_str(), "wb"))
+					{
+						std::fputs(patch.text, file);
+						std::fclose(file);
+						ProbeLog("Bundled patch installed: %s\n", path.c_str());
+					}
+				}
+				if (!Marker(patch.enabled_marker))
+				{
+					std::vector<std::string> enabled = LoadEnabledCheats(patch.serial);
+					const std::string key = std::string("P|") + patch.name;
+					if (std::find(enabled.begin(), enabled.end(), key) == enabled.end())
+					{
+						enabled.push_back(key);
+						SaveEnabledCheats(patch.serial, enabled);
+					}
+					SetMarker(patch.enabled_marker, true);
+					ProbeLog("Bundled patch enabled for %s: %s\n", patch.serial, patch.name);
+				}
+			}
+		}
 		std::string CheatKey(const CheatEntry& entry)
 		{
 			return std::string(entry.patch ? "P|" : "C|") + entry.name;
@@ -1316,6 +1372,7 @@ namespace PS4GameMenu
 		sceSystemServiceHideSplashScreen();
 		PlayStartupSequence();
 		MigrateSettings();
+		InstallBundledPatches();
 		// (AI-assisted) Query the public release endpoint asynchronously. The
 		// launcher remains usable while DNS/HTTPS is in progress.
 		PS4Release::Start();
