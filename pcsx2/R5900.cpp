@@ -18,6 +18,7 @@
 #if defined(PCSX2_PS4_VM_BOOT)
 #include "ps4/core/EEEventProfilePS4.h"
 #include "ps4/core/EEHotspotsPS4.h"
+#include "ps4/core/WorkerProfilePS4.h"
 #endif
 
 #include "Hardware.h"
@@ -466,7 +467,10 @@ __fi void _cpuEventTest_Shared()
 		//if( EEsCycle < -450 )
 		//	Console.WriteLn( " IOP ahead by: %d cycles", -EEsCycle );
 
-		EEsCycle = psxCpu->ExecuteBlock(EEsCycle);
+		{
+			PS4_WORKER_SCOPE(EEIOP);
+			EEsCycle = psxCpu->ExecuteBlock(EEsCycle);
+		}
 
 		iopEventAction = false;
 	}
