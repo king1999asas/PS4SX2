@@ -596,10 +596,13 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 	int ee_cycle_rate = -1;
 	if (access("/data/PS4SX2/vm-ee-cycle-normal", F_OK) == 0)
 		ee_cycle_rate = 0;
+	else if (access("/data/PS4SX2/vm-ee-cycle-minimum", F_OK) == 0)
+		ee_cycle_rate = -3;
 	else if (access("/data/PS4SX2/vm-ee-cycle-underclock", F_OK) == 0)
 		ee_cycle_rate = -2;
 	settings->SetIntValue("EmuCore/Speedhacks", "EECycleRate", ee_cycle_rate);
-	const int ee_cycle_skip = access("/data/PS4SX2/vm-ee-cycle-skip2", F_OK) == 0 ? 2 :
+	const int ee_cycle_skip = access("/data/PS4SX2/vm-ee-cycle-skip3", F_OK) == 0 ? 3 :
+	                          access("/data/PS4SX2/vm-ee-cycle-skip2", F_OK) == 0 ? 2 :
 	                          access("/data/PS4SX2/vm-ee-cycle-skip", F_OK) == 0 ? 1 : 0;
 	settings->SetIntValue("EmuCore/Speedhacks", "EECycleSkip", ee_cycle_skip);
 	const bool fast_cdvd = access("/data/PS4SX2/vm-fast-cdvd", F_OK) == 0 &&
