@@ -628,14 +628,25 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 		settings->SetIntValue("EmuCore/GS", "accurate_blending_unit", static_cast<int>(AccBlendLevel::Minimum));
 	else
 		settings->DeleteValue("EmuCore/GS", "accurate_blending_unit");
+	// Fast math: no overflow/underflow clamping in the EE FPU and VU recompilers,
+	// like PCSX2's "None" clamping mode. Fewer instructions per FPU/VU op.
+	const bool fast_math = access("/data/PS4SX2/vm-fast-math", F_OK) == 0;
+	for (const char* key : {"vu0Overflow", "vu0ExtraOverflow", "vu0SignOverflow", "vu0Underflow", "vu1Overflow",
+			 "vu1ExtraOverflow", "vu1SignOverflow", "vu1Underflow", "fpuOverflow", "fpuExtraOverflow", "fpuFullMode"})
+	{
+		if (fast_math)
+			settings->SetBoolValue("EmuCore/CPU/Recompiler", key, false);
+		else
+			settings->DeleteValue("EmuCore/CPU/Recompiler", key);
+	}
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 	g_ps4_skip_smc_checks = access("/data/PS4SX2/vm-skip-smc", F_OK) == 0;
 	g_ps4_bytecopy_fusion = g_ps4_skip_smc_checks && access("/data/PS4SX2/vm-no-bytecopy-fusion", F_OK) != 0;
 #endif
 	VMManager::ApplySettings();
-	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d readback=%d minBlend=%d\n",
+	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d readback=%d minBlend=%d fastMath=%d\n",
 		ee_cycle_rate, ee_cycle_skip, fast_cdvd ? 1 : 0, fast_boot ? 1 : 0, audio_enabled ? 1 : 0, download_mode,
-		minimum_blending ? 1 : 0);
+		minimum_blending ? 1 : 0, fast_math ? 1 : 0);
 }
 
 static void* RunVM(void*)
