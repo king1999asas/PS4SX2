@@ -569,6 +569,9 @@ extern u16 OutPos;
 extern u16 InputPos;
 // SPU Mixing Cycles ("Ticks mixed" counter)
 extern u32 Cycles;
+// True when nothing listens to the mixed audio (null output, no capture): the mixer
+// then keeps only what the game can observe (addresses, envelopes, IRQs).
+extern bool SPU2SilentMix;
 
 extern s16 spu2regs[0x010000 / sizeof(s16)];
 extern s16 _spu2mem[0x200000 / sizeof(s16)];
