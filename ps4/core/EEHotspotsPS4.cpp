@@ -98,6 +98,33 @@ namespace PS4EEHotspots
 			return (random & mask) == 0;
 		}
 
+		// Logs up to 128 instruction words (512 bytes) around pc, in lines of 8,
+		// once per address; never crosses the VTLB page, never calls a handler.
+		void DumpCodeOnce(u32 pc)
+		{
+			static u32 s_dumped[16]{};
+			static u32 s_dumped_count = 0;
+			for (u32 i = 0; i < s_dumped_count; ++i)
+				if (s_dumped[i] == pc)
+					return;
+			if (s_dumped_count == std::size(s_dumped))
+				return;
+			s_dumped[s_dumped_count++] = pc;
+			const u32 page = pc & ~4095U;
+			const u32 first = (pc & ~31U) - std::min(128U, (pc & ~31U) - page);
+			const u32 last = std::min(page + 4096, first + 512);
+			const auto mapping = vtlb_private::vtlbdata.vmap[first >> vtlb_private::VTLB_PAGE_BITS];
+			if (mapping.isHandler(first))
+				return;
+			for (u32 address = first; address + 32 <= last; address += 32)
+			{
+				u32 words[8];
+				std::memcpy(words, reinterpret_cast<const void*>(mapping.assumePtr(address)), sizeof(words));
+				ProbeLog("EE hotspot code: pc=%08x at=%08x %08x %08x %08x %08x %08x %08x %08x %08x\n", pc, address,
+					words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+			}
+		}
+
 		void LogHistogram(const char* kind, Histogram& histogram)
 		{
 			ProbeLog("EE hotspots: kind=%s samples=%u dropped=%u metric=occurrences_not_CPU_time\n",
@@ -128,6 +155,10 @@ namespace PS4EEHotspots
 					std::memcpy(words, reinterpret_cast<const void*>(mapping.assumePtr(first)), count * 4);
 					ProbeLog("EE hotspot context: start=%08x words=%u data=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 						first, count, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+					// The busiest code (first entry) is also dumped in full once, so a
+					// native replacement for it can be written from the log.
+					if (&entry == &top.front())
+						DumpCodeOnce(entry.pc);
 				}
 			}
 			histogram = {};
