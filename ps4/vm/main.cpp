@@ -648,6 +648,43 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 		else
 			settings->DeleteValue("EmuCore/CPU/Recompiler", key);
 	}
+	// Cheats and patches enabled for this game in the launcher's Trucos view
+	// (game-settings/SERIAL.cheats: "C|name" = cheat, "P|name" = patch).
+	std::vector<std::string> enabled_cheats, enabled_patches;
+	{
+		const auto read_line = [](FILE* file, std::string& out) {
+			char line[512];
+			if (!std::fgets(line, sizeof(line), file))
+				return false;
+			out = line;
+			while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+				out.pop_back();
+			return true;
+		};
+		std::string serial;
+		if (FILE* file = std::fopen("/data/PS4SX2/game-settings/current.txt", "rb"))
+		{
+			read_line(file, serial);
+			std::fclose(file);
+		}
+		FILE* file = serial.empty() ? nullptr : std::fopen(("/data/PS4SX2/game-settings/" + serial + ".cheats").c_str(), "rb");
+		for (std::string line; file && read_line(file, line);)
+		{
+			if (line.size() > 2 && line[1] == '|')
+				(line[0] == 'P' ? enabled_patches : enabled_cheats).push_back(line.substr(2));
+		}
+		if (file)
+			std::fclose(file);
+	}
+	settings->SetBoolValue("EmuCore", "EnableCheats", !enabled_cheats.empty());
+	if (enabled_cheats.empty())
+		settings->DeleteValue("Cheats", "Enable");
+	else
+		settings->SetStringList("Cheats", "Enable", enabled_cheats);
+	if (enabled_patches.empty())
+		settings->DeleteValue("Patches", "Enable");
+	else
+		settings->SetStringList("Patches", "Enable", enabled_patches);
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 	g_ps4_skip_smc_checks = access("/data/PS4SX2/vm-skip-smc", F_OK) == 0;
 	g_ps4_bytecopy_fusion = g_ps4_skip_smc_checks && access("/data/PS4SX2/vm-no-bytecopy-fusion", F_OK) != 0;
@@ -656,6 +693,10 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d readback=%d minBlend=%d fastMath=%d\n",
 		ee_cycle_rate, ee_cycle_skip, fast_cdvd ? 1 : 0, fast_boot ? 1 : 0, audio_enabled ? 1 : 0, download_mode,
 		minimum_blending ? 1 : 0, fast_math ? 1 : 0);
+	for (const std::string& name : enabled_cheats)
+		ProbeLog("Launcher cheat enabled: %s\n", name.c_str());
+	for (const std::string& name : enabled_patches)
+		ProbeLog("Launcher patch enabled: %s\n", name.c_str());
 }
 
 static void* RunVM(void*)
