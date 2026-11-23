@@ -251,6 +251,9 @@ void Host::LoadSettings(SettingsInterface& si, std::unique_lock<std::mutex>&)
 	// No persistent settings storage on PS4; use defaults.
 }
 
+// Defined in main.cpp: per-session averages for the USB log summary.
+void PS4SessionStatsAdd(double speed, double fps, double ee, double gs, double vu1, double gpu);
+
 void Host::OnPerformanceMetricsUpdated()
 {
 	// (AI-assisted) This callback runs on the GS thread, which owns these metrics.
@@ -279,6 +282,9 @@ void Host::OnPerformanceMetricsUpdated()
 		vu_usage, PerformanceMetrics::GetVUThreadAverageTime(),
 		(ee_usage + gs_usage + vu_usage > 0.0) ? "samples" : "no_samples",
 		PerformanceMetrics::GetGPUUsage(), gpu_ms, gpu_ms > 0.0f ? "samples" : "no_samples");
+	if (profile_interval > 0.0)
+		PS4SessionStatsAdd(PerformanceMetrics::GetSpeed(), PerformanceMetrics::GetInternalFPS(), ee_usage, gs_usage,
+			vu_usage, PerformanceMetrics::GetGPUUsage());
 	PS4IPUProfile::LogInterval(profile_interval);
 	PS4EEEventProfile::LogInterval(profile_interval);
 	PS4GSProfile::LogInterval(profile_interval);
