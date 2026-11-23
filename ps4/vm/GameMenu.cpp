@@ -836,6 +836,17 @@ namespace PS4GameMenu
 				"patch=1,EE,00203140,word,03e00008\n"
 				"patch=1,EE,00203144,word,00000000\n",
 				"bundled-bee-shadows-v1"},
+			// Applied by the emulator itself while the disc is read (see BeeCarMute in
+			// main.cpp); the entry only switches it on and off.
+			{"SLES-55016", "SLES-55016_9D6AA1B8_sonido.pnach", "Sonido: sin motores de coches",
+				"gametitle=DreamWorks Bee Movie Game (PAL) [SLES-55016] (9D6AA1B8)\n"
+				"\n"
+				"[Sonido: sin motores de coches]\n"
+				"author=PS4SX2\n"
+				"description=Silencia los motores (trafico, tu coche, moto y carreras), derrapes y bocinas, que se oian en las cinematicas y tapaban todo. Golpes, musica y voces siguen igual. Se aplica al iniciar el juego.\n"
+				"// No patch lines: PS4SX2 lowers those sounds to the game's own -96 dB silence\n"
+				"// as their data is read from the disc.\n",
+				"bundled-bee-carmute-v1"},
 		};
 		void InstallBundledPatches()
 		{
