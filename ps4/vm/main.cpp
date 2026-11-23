@@ -150,6 +150,139 @@ static Common::Timer s_run_timer;
 static double s_last_log = -5.0;
 static double s_last_input = -1.0;
 static double s_last_pause_log = -5.0;
+
+// (fork) One copy of the last game session's log on the USB drive, readable on a PC
+// without FTP: /mnt/usbN/logs/PS4SX2-registro.txt, rewritten every 30 s while a game
+// runs and once more on exit (a crash or a forced close keeps the last copy). The
+// old copies of the separate log files in that folder are deleted, so only this
+// file remains. Menu-only sessions never touch the USB.
+static bool s_game_session = false;
+static double s_last_usb_copy = 0.0;
+namespace UsbLog
+{
+	constexpr const char* FileName = "PS4SX2-registro.txt";
+	constexpr const char* SourcePath = "/data/PS4SX2/logs/PCSX2-vm-boot.log";
+	std::atomic<bool> s_busy{false};
+	bool s_cleaned = false;
+	bool s_reported = false;
+	char s_buffer[64 * 1024]; // used only by the copy that holds s_busy
+
+	std::string FindTargetDir()
+	{
+		for (int i = 0; i < 8; ++i)
+		{
+			char root[32];
+			std::snprintf(root, sizeof(root), "/mnt/usb%d", i);
+			struct stat st{};
+			if (stat(root, &st) != 0 || !S_ISDIR(st.st_mode))
+				continue;
+			const std::string dir = std::string(root) + "/logs";
+			mkdir(dir.c_str(), 0777);
+			if (stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && access(dir.c_str(), W_OK) == 0)
+				return dir;
+		}
+		return {};
+	}
+
+	void RemoveOldCopies(const std::string& dir)
+	{
+		static constexpr const char* files[] = {"PCSX2-vm-boot.log", "PCSX2-vm-stdout.log", "PCSX2-vm-stderr.log",
+			"emulog.txt", "session-platform.txt", "xmb-trace.log", "legacy-xmb-trace.log"};
+		for (const char* sub : {"", "/last-game-PS2", "/last-game-PS1", "/previous-menu"})
+		{
+			const std::string folder = dir + sub;
+			for (const char* file : files)
+				unlink((folder + "/" + file).c_str());
+			if (*sub)
+				rmdir(folder.c_str()); // only succeeds if nothing else is left in it
+		}
+	}
+
+	// Caller holds s_busy.
+	long long CopyNow()
+	{
+		const std::string dir = FindTargetDir();
+		if (dir.empty())
+			return -1;
+		const int in = open(SourcePath, O_RDONLY);
+		if (in < 0)
+			return -1;
+		const std::string target = dir + "/" + FileName;
+		const int out = open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (out < 0)
+		{
+			close(in);
+			return -1;
+		}
+		long long total = 0;
+		ssize_t n;
+		while ((n = read(in, s_buffer, sizeof(s_buffer))) > 0)
+		{
+			if (write(out, s_buffer, static_cast<size_t>(n)) != n)
+			{
+				total = -1;
+				break;
+			}
+			total += n;
+		}
+		close(in);
+		fsync(out);
+		close(out);
+		if (!s_cleaned)
+		{
+			RemoveOldCopies(dir);
+			s_cleaned = true;
+		}
+		return total;
+	}
+
+	void* CopyThread(void*)
+	{
+		const long long bytes = CopyNow();
+		if (!s_reported)
+		{
+			s_reported = true;
+			if (bytes >= 0)
+				ProbeLog("USB log: copying this session's log to %s/%s every 30 s\n", FindTargetDir().c_str(), FileName);
+			else
+				ProbeLog("USB log: no writable USB drive found (/mnt/usb0-7); log copy skipped\n");
+		}
+		s_busy.store(false, std::memory_order_release);
+		return nullptr;
+	}
+
+	// Copies in a background thread; skipped if a copy is still running.
+	void CopyAsync()
+	{
+		bool expected = false;
+		if (!s_busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			return;
+		pthread_attr_t attr;
+		pthread_attr_init(&attr);
+		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+		pthread_attr_setstacksize(&attr, 128 * 1024);
+		pthread_t thread;
+		if (pthread_create(&thread, &attr, CopyThread, nullptr) != 0)
+			s_busy.store(false, std::memory_order_release);
+		pthread_attr_destroy(&attr);
+	}
+
+	// Final copy on exit, after the log file is complete and closed.
+	void CopyFinal()
+	{
+		for (int waited = 0; waited < 3000; waited += 20)
+		{
+			bool expected = false;
+			if (s_busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+			{
+				CopyNow();
+				s_busy.store(false, std::memory_order_release);
+				return;
+			}
+			usleep(20 * 1000);
+		}
+	}
+} // namespace UsbLog
 static u32 s_last_ee_cycle = 0;
 static u64 s_host_poll_calls = 0;
 static u64 s_last_host_poll_calls = 0;
@@ -315,6 +448,11 @@ void VMHostPoll()
 		s_last_host_poll_calls = s_host_poll_calls;
 		s_last_log = elapsed;
 		s_last_ee_cycle = cpuRegs.cycle;
+		if (s_game_session && elapsed - s_last_usb_copy >= 30.0)
+		{
+			s_last_usb_copy = elapsed;
+			UsbLog::CopyAsync();
+		}
 			ProbeLog("VM heartbeat: seconds=%.1f EE_PC=%08x IOP_PC=%08x EE_cycles=%u EE_Mcycles_per_second=%.2f "
 				 "Host_polls_per_second=%.0f Host_clock_checks_per_second=%.0f CPU_queue_drain_locks=%llu verbose=%d paused=%d menu=%d vsyncq=%d\n",
 			elapsed, cpuRegs.pc, psxRegs.pc,
@@ -1023,6 +1161,7 @@ static void* RunVM(void*)
 			PS4GameMenu::HideLoading();
 		}
 		VMManager::SetPaused(false);
+		s_game_session = true;
 		while (VMManager::GetState() != VMState::Stopping && VMManager::GetState() != VMState::Shutdown)
 		{
 			if (VMManager::GetState() == VMState::Paused)
@@ -1197,6 +1336,8 @@ int main()
 		fsync(s_log);
 		close(s_log);
 	}
+	if (s_game_session)
+		UsbLog::CopyFinal();
 	if (relaunch_main_menu)
 	{
 		// VM teardown closes Vulkan/VideoOut resources. Reinitializing them in the
