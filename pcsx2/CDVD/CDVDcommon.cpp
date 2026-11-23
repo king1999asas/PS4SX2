@@ -444,10 +444,16 @@ void DoCDVDclose()
 	DoCDVDresetDiskTypeCache();
 }
 
+// (fork) Optional per-game fix-up of 2048-byte data sectors as the game reads them
+// (set by the PS4 frontend; null for almost every game).
+void (*g_ps4_disc_read_hook)(u8* buffer, u32 lsn) = nullptr;
+
 s32 DoCDVDreadSector(u8* buffer, u32 lsn, int mode)
 {
 	CheckNullCDVD();
 	int ret = CDVD->readSector(buffer, lsn, mode);
+	if (ret == 0 && mode == CDVD_MODE_2048 && g_ps4_disc_read_hook)
+		g_ps4_disc_read_hook(buffer, lsn);
 
 	if (ret == 0 && blockDumpFile.IsOpened())
 	{
@@ -507,6 +513,8 @@ s32 DoCDVDgetBuffer(u8* buffer)
 {
 	CheckNullCDVD();
 	const int ret = CDVD->getBuffer(buffer);
+	if (ret == 0 && lastReadSize == 2048 && g_ps4_disc_read_hook)
+		g_ps4_disc_read_hook(buffer, lastLSN);
 
 	if (ret == 0 && blockDumpFile.IsOpened())
 	{
