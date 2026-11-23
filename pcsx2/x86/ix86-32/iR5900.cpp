@@ -151,6 +151,17 @@ u64 g_ps4_bytecopy_state = 0;
 u64 g_ps4_bytecopy_scratch = 0;
 u32 g_ps4_bytecopy_last_source = 0;
 u32 g_ps4_bytecopy_last_destination = 0;
+// (fork) Byte-fill loops (the tail of libc memset: store one byte, count down,
+// step the pointer) run natively in batches. Unlike the copy fusion this works
+// with exact SMC checks: the fill only writes data pages, blocks on manually
+// checked pages verify their own code, and write-protected code pages decline.
+bool g_ps4_bytefill_fusion = true;
+static bool s_ps4_bytefill_loop;
+static u32 s_ps4_bytefill_config;
+u64 g_ps4_bytefill_blocks = 0;
+u64 g_ps4_bytefill_runs = 0;
+u64 g_ps4_bytefill_bytes = 0;
+u64 g_ps4_bytefill_declined = 0;
 
 // save states for branches
 GPR_reg64 s_saveConstRegs[32];
@@ -1824,6 +1835,70 @@ static u32 PS4FastByteCopyLoop(u32 config)
 	g_ps4_bytecopy_scratch += source_scratch || destination_scratch;
 	return 1;
 }
+
+// Runs up to one page (and up to the next event) of a matched byte-fill loop.
+// Returns 0 without touching any guest state when it declines; the recompiled
+// loop then runs normally.
+static u32 PS4FastByteFillLoop(u32 config)
+{
+	const u32 value_reg = config & 31;
+	const u32 count_reg = (config >> 5) & 31;
+	const u32 destination_reg = (config >> 10) & 31;
+	const u32 limit_reg = (config >> 15) & 31;
+	const u32 loop_cycles = (config >> 20) & 127;
+	const u32 exit_offset = ((config >> 27) & 31) * 4;
+	const u32 start_pc = cpuRegs.pc;
+	const u32 destination_address = cpuRegs.GPR.r[destination_reg].UL[0];
+	const u32 count = cpuRegs.GPR.r[count_reg].UL[0];
+	const s64 limit = cpuRegs.GPR.r[limit_reg].SD[0];
+
+	// ADDIU sign-extends 32 bits, whereas BNE compares 64 bits.
+	if (limit != static_cast<s32>(limit) || loop_cycles == 0 || cpuRegs.nextEventCycle <= cpuRegs.cycle)
+	{
+		++g_ps4_bytefill_declined;
+		return 0;
+	}
+	// The counter drops by one per iteration and the loop exits when it equals limit.
+	const u32 iterations_to_limit = count - static_cast<u32>(limit);
+	u64 iterations = iterations_to_limit != 0 ? iterations_to_limit : (1ULL << 32);
+	// Events are checked after a whole guest loop, just as in iBranchTest().
+	const u64 cycles_until_event = cpuRegs.nextEventCycle - cpuRegs.cycle;
+	iterations = std::min(iterations, cycles_until_event / loop_cycles + (cycles_until_event % loop_cycles != 0));
+	iterations = std::min<u64>(iterations, vtlb_private::VTLB_PAGE_SIZE - (destination_address & vtlb_private::VTLB_PAGE_MASK));
+	u8* destination = nullptr;
+	bool destination_scratch = false;
+	if (iterations == 0 ||
+		!PS4ResolveCopyRAM(destination_address, static_cast<u32>(iterations), &destination, &destination_scratch) ||
+		(!destination_scratch &&
+			mmap_GetRamPageInfo(static_cast<u32>(destination - eeMem->Main)) == ProtMode_Write))
+	{
+		++g_ps4_bytefill_declined;
+		return 0;
+	}
+
+	// Exact SMC semantics: never let a batch overwrite the loop's own code.
+	const auto code_mapping = vtlb_private::vtlbdata.vmap[start_pc >> vtlb_private::VTLB_PAGE_BITS];
+	if (!code_mapping.isHandler(start_pc))
+	{
+		const u8* code = reinterpret_cast<const u8*>(code_mapping.assumePtr(start_pc));
+		if (destination < code + exit_offset && code < destination + iterations)
+		{
+			++g_ps4_bytefill_declined;
+			return 0;
+		}
+	}
+
+	std::memset(destination, static_cast<u8>(cpuRegs.GPR.r[value_reg].UL[0]), static_cast<size_t>(iterations));
+	const u32 next_destination = destination_address + static_cast<u32>(iterations);
+	const u32 next_count = count - static_cast<u32>(iterations);
+	cpuRegs.GPR.r[destination_reg].SD[0] = static_cast<s32>(next_destination);
+	cpuRegs.GPR.r[count_reg].SD[0] = static_cast<s32>(next_count);
+	cpuRegs.cycle += iterations * loop_cycles;
+	cpuRegs.pc = (static_cast<s64>(static_cast<s32>(next_count)) == limit) ? (start_pc + exit_offset) : start_pc;
+	++g_ps4_bytefill_runs;
+	g_ps4_bytefill_bytes += iterations;
+	return 1;
+}
 #endif
 
 u32 scaleblockcycles_clear()
@@ -3060,6 +3135,8 @@ StartRecomp:
 	s_ps4_bytecopy_loop = false;
 	s_ps4_bytecopy_config = 0;
 	s_ps4_bytecopy_native = nullptr;
+	s_ps4_bytefill_loop = false;
+	s_ps4_bytefill_config = 0;
 	if (s_branchTo == startpc)
 	{
 		// PS5 port (vk-285-126, AI-assisted): the rule below, as a function of `wider`. Upstream only treats a
@@ -3304,6 +3381,72 @@ StartRecomp:
 			}
 		}
 	}
+
+	// (fork) Byte-fill loop: one "sb V,0(D)", one "addiu C,C,-1", one "addiu D,D,1"
+	// after the store, any number of nops, then "bne C,L,start" whose delay slot
+	// is a nop or the pointer step. Every other shape keeps the normal code.
+	const u32 fill_words = (s_nEndBlock - startpc) / 4;
+	if (g_ps4_bytefill_fusion && !s_ps4_bytecopy_loop && s_branchTo == startpc && s_nEndBlock > startpc &&
+		fill_words >= 4 && fill_words <= 12)
+	{
+		const auto opcode = [](u32 instruction) { return instruction >> 26; };
+		const auto rs = [](u32 instruction) { return (instruction >> 21) & 31; };
+		const auto rt = [](u32 instruction) { return (instruction >> 16) & 31; };
+		const auto imm = [](u32 instruction) { return static_cast<s16>(instruction & 0xffff); };
+		const u32 branch = memRead32(s_nEndBlock - 8);
+		const u32 delay = memRead32(s_nEndBlock - 4);
+		const bool branch_back = opcode(branch) == 5 &&
+		                         (s_nEndBlock - 8) + 4 + static_cast<s32>(imm(branch)) * 4 == startpc;
+		u32 value_reg = 0, count_reg = rs(branch), destination_reg = 0, limit_reg = rt(branch);
+		int stores = 0, decrements = 0, steps = 0;
+		bool shape_ok = branch_back;
+		for (u32 address = startpc; shape_ok && address < s_nEndBlock; address += 4)
+		{
+			if (address == s_nEndBlock - 8)
+				continue; // the branch itself
+			const u32 instruction = memRead32(address);
+			const bool in_delay_slot = address == s_nEndBlock - 4;
+			if (instruction == 0)
+				continue;
+			if (opcode(instruction) == 0x28 && imm(instruction) == 0 && !in_delay_slot && stores == 0 && steps == 0)
+			{
+				value_reg = rt(instruction);
+				destination_reg = rs(instruction);
+				++stores;
+			}
+			else if (opcode(instruction) == 9 && imm(instruction) == -1 && !in_delay_slot &&
+			         rs(instruction) == count_reg && rt(instruction) == count_reg && decrements == 0)
+				++decrements;
+			else if (opcode(instruction) == 9 && imm(instruction) == 1 && stores == 1 && steps == 0 &&
+			         rs(instruction) == destination_reg && rt(instruction) == destination_reg)
+				++steps;
+			else
+				shape_ok = false;
+		}
+		(void)delay;
+		const bool registers_ok = value_reg != 0 && count_reg != 0 && destination_reg != 0 && limit_reg != 0 &&
+		                          value_reg != count_reg && value_reg != destination_reg && value_reg != limit_reg &&
+		                          count_reg != destination_reg && count_reg != limit_reg && destination_reg != limit_reg;
+		if (shape_ok && stores == 1 && decrements == 1 && steps == 1 && registers_ok)
+		{
+			// Same cycle cost as the recompiled loop, including nops and the branch.
+			u32 fixed_cycles = 0;
+			for (u32 address = startpc; address < s_nEndBlock; address += 4)
+				fixed_cycles += R5900::GetInstruction(memRead32(address)).cycles;
+			fixed_cycles *= 2 - ((cpuRegs.CP0.n.Config >> 18) & 1);
+			const u32 saved_cycles = s_nBlockCycles;
+			s_nBlockCycles = fixed_cycles;
+			const u32 loop_cycles = scaleblockcycles_calculation();
+			s_nBlockCycles = saved_cycles;
+			if (loop_cycles > 0 && loop_cycles < 128)
+			{
+				s_ps4_bytefill_loop = true;
+				s_ps4_bytefill_config = value_reg | (count_reg << 5) | (destination_reg << 10) | (limit_reg << 15) |
+				                        (loop_cycles << 20) | (fill_words << 27);
+				++g_ps4_bytefill_blocks;
+			}
+		}
+	}
 #endif
 
 	// rec info //
@@ -3366,7 +3509,7 @@ StartRecomp:
 	memory_protect_recompiled_code(startpc, (s_nEndBlock - startpc) >> 2);
 
 	// Skip Recompilation if sceMpegIsEnd Pattern detected
-	const bool doRecompilation = s_ps4_bytecopy_loop ||
+	const bool doRecompilation = s_ps4_bytecopy_loop || s_ps4_bytefill_loop ||
 	                             (!skipMPEG_By_Pattern(startpc) && !recSkipTimeoutLoop(timeout_reg, is_timeout_loop));
 
 #if defined(PCSX2_PS4_VM_BOOT)
@@ -3391,6 +3534,24 @@ StartRecomp:
 		xADD(ptr64[&g_ps4_bytecopy_deadline], 1);
 		native_copy.SetTarget();
 		s_ps4_bytecopy_native = xGetPtr();
+	}
+	if (s_ps4_bytefill_loop)
+	{
+		iFlushCall(FLUSH_EVERYTHING | FLUSH_PC);
+		// Run the batch before the recompiled loop; if the helper declines, fall
+		// through to the normal code for this iteration.
+		xMOV(rax, ptr64[&cpuRegs.cycle]);
+		xSUB(rax, ptr64[&cpuRegs.nextEventCycle]);
+		xForwardJump32 fill_deadline(Jcc_Unsigned);
+		xFastCall((void*)PS4FastByteFillLoop, s_ps4_bytefill_config);
+		xTEST(eax, eax);
+		xForwardJump32 fill_declined(Jcc_Zero);
+		xMOV(rax, ptr64[&cpuRegs.cycle]);
+		xSUB(rax, ptr64[&cpuRegs.nextEventCycle]);
+		xJS(DispatcherReg);
+		xJMP((void*)DispatcherEvent);
+		fill_deadline.SetTarget();
+		fill_declined.SetTarget();
 	}
 #endif
 	if (doRecompilation)
