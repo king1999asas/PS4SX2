@@ -1109,49 +1109,50 @@ namespace BeeCarMute
 	{
 		u32 offset; // byte offset of the volume in the disc image
 		u32 original;
+		const char* name;
 	};
 	constexpr Fix Fixes[] = {
-		{49261920, 0xc1900000}, // CarIdle
-		{49262276, 0xc0800000}, // BeeHiveCar_Drift_Lp
-		{49262744, 0xc1180000}, // Beehivescooter01_Lp
-		{49264872, 0xc2480000}, // BeeHiveCar02_Lp
-		{49266900, 0xc1500000}, // HiveCar01_Lp
-		{49267256, 0xc1100000}, // HiveCar02_Lp
-		{49267612, 0xc1500000}, // HiveCar03_Lp
-		{49267968, 0xc1c80000}, // BonusCar03_Lp
-		{49268324, 0xc1500000}, // BonusCar04_Lp
-		{49268680, 0xc1b80000}, // BonusCar05_Lp
-		{49269036, 0xc1600000}, // HiveCar04_Lp
-		{49269392, 0xc1a80000}, // HiveCar05_Lp
-		{49269748, 0xc0c00000}, // HiveCab_Lp
-		{49270104, 0xc1a00000}, // honexCar_Lp
-		{49270460, 0xc1ac0000}, // BonusCar02_Lp
-		{49270816, 0xc1900000}, // BonusCar01_Lp
-		{49271512, 0x00000000}, // Npc_honexCar_Lp
-		{49271868, 0xc0c00000}, // Npc_HiveCar05_Lp
-		{49272224, 0xc0800000}, // Npc_HiveCar04_Lp
-		{49272580, 0xc0900000}, // Npc_HiveCar03_Lp
-		{49272936, 0xbfc00000}, // Npc_HiveCar02_Lp
-		{49273292, 0xc0400000}, // Npc_HiveCar01_Lp
-		{49273648, 0xc0a00000}, // Npc_HiveCab_Lp
-		{49274004, 0xc1200000}, // RaceCar01
-		{49274360, 0xc1200000}, // RaceCar02
-		{49274716, 0xc1980000}, // HiveSuperCab_Lp
-		{49275072, 0x00000000}, // Horn_HiveCar01
-		{49275412, 0x00000000}, // Horn_HiveCar02
-		{49275752, 0x00000000}, // Horn_HiveCar03
-		{49276092, 0x00000000}, // Horn_HiveCar04
-		{49276432, 0x00000000}, // Horn_HiveCar05
-		{49276772, 0x00000000}, // Horn_BonusCar01
-		{49277112, 0x00000000}, // Horn_BonusCar02
-		{49277452, 0x00000000}, // Horn_BonusCar03
-		{49277792, 0x00000000}, // Horn_BonusCar04
-		{49278132, 0x00000000}, // Horn_BonusCar05
-		{69596652, 0xc1200000}, // BeeUnderCar_Lp
-		{69599032, 0x00000000}, // RainCarEngine_3D_Lp
-		{208582344, 0x00000000}, // Race_Npc_Car_Drift_3D_Lp
-		{336736704, 0xc0200000}, // Random_CityHornAmb
-		{343362268, 0xc0200000}, // Random_CityHornAmb
+		{49261920, 0xc1900000, "CarIdle"},
+		{49262276, 0xc0800000, "BeeHiveCar_Drift_Lp"},
+		{49262744, 0xc1180000, "Beehivescooter01_Lp"},
+		{49264872, 0xc2480000, "BeeHiveCar02_Lp"},
+		{49266900, 0xc1500000, "HiveCar01_Lp"},
+		{49267256, 0xc1100000, "HiveCar02_Lp"},
+		{49267612, 0xc1500000, "HiveCar03_Lp"},
+		{49267968, 0xc1c80000, "BonusCar03_Lp"},
+		{49268324, 0xc1500000, "BonusCar04_Lp"},
+		{49268680, 0xc1b80000, "BonusCar05_Lp"},
+		{49269036, 0xc1600000, "HiveCar04_Lp"},
+		{49269392, 0xc1a80000, "HiveCar05_Lp"},
+		{49269748, 0xc0c00000, "HiveCab_Lp"},
+		{49270104, 0xc1a00000, "honexCar_Lp"},
+		{49270460, 0xc1ac0000, "BonusCar02_Lp"},
+		{49270816, 0xc1900000, "BonusCar01_Lp"},
+		{49271512, 0x00000000, "Npc_honexCar_Lp"},
+		{49271868, 0xc0c00000, "Npc_HiveCar05_Lp"},
+		{49272224, 0xc0800000, "Npc_HiveCar04_Lp"},
+		{49272580, 0xc0900000, "Npc_HiveCar03_Lp"},
+		{49272936, 0xbfc00000, "Npc_HiveCar02_Lp"},
+		{49273292, 0xc0400000, "Npc_HiveCar01_Lp"},
+		{49273648, 0xc0a00000, "Npc_HiveCab_Lp"},
+		{49274004, 0xc1200000, "RaceCar01"},
+		{49274360, 0xc1200000, "RaceCar02"},
+		{49274716, 0xc1980000, "HiveSuperCab_Lp"},
+		{49275072, 0x00000000, "Horn_HiveCar01"},
+		{49275412, 0x00000000, "Horn_HiveCar02"},
+		{49275752, 0x00000000, "Horn_HiveCar03"},
+		{49276092, 0x00000000, "Horn_HiveCar04"},
+		{49276432, 0x00000000, "Horn_HiveCar05"},
+		{49276772, 0x00000000, "Horn_BonusCar01"},
+		{49277112, 0x00000000, "Horn_BonusCar02"},
+		{49277452, 0x00000000, "Horn_BonusCar03"},
+		{49277792, 0x00000000, "Horn_BonusCar04"},
+		{49278132, 0x00000000, "Horn_BonusCar05"},
+		{69596652, 0xc1200000, "BeeUnderCar_Lp"},
+		{69599032, 0x00000000, "RainCarEngine_3D_Lp"},
+		{208582344, 0x00000000, "Race_Npc_Car_Drift_3D_Lp"},
+		{336736704, 0xc0200000, "Random_CityHornAmb"},
+		{343362268, 0xc0200000, "Random_CityHornAmb"},
 	};
 	constexpr u32 Silent = 0xc2c00000; // -96.0f
 	static std::atomic<u32> s_applied{0};
@@ -1174,11 +1175,45 @@ namespace BeeCarMute
 			if (value != fix->original || tag != 0x3ed)
 				continue;
 			std::memcpy(buffer + pos, &Silent, sizeof(Silent));
-			if (s_applied.fetch_add(1, std::memory_order_relaxed) < 2)
-				ProbeLog("Bee Movie: car sound muted at disc offset %u\n", fix->offset);
+			const u32 count = s_applied.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (count <= 128)
+				ProbeLog("Bee Movie: car sound muted: %s (disc offset %u, applied %u)\n", fix->name, fix->offset, count);
 		}
 	}
 } // namespace BeeCarMute
+
+// (fork) Which parts of the disc a game reads, and when: contiguous runs of 256 KB
+// or more are logged when the next non-contiguous read starts, so the log shows
+// level loads, streamed videos and audio next to the performance lines.
+namespace DiscReadLog
+{
+	static bool s_bee_car_mute = false;
+	static u32 s_first = 0, s_next = 0, s_sectors = 0;
+
+	static void Flush()
+	{
+		if (s_sectors >= 128)
+			ProbeLog("Disc read: %.2f-%.2f MB (%u KB, sectors %u-%u)\n", s_first * 2048.0 / 1048576.0,
+				(s_first + s_sectors) * 2048.0 / 1048576.0, s_sectors * 2, s_first, s_first + s_sectors - 1);
+		s_sectors = 0;
+	}
+
+	static void Hook(u8* buffer, u32 lsn)
+	{
+		if (s_sectors == 0 || lsn != s_next)
+		{
+			// Repeated reads of the same sector (retries, buffered re-reads) do not split a run.
+			if (s_sectors != 0 && lsn == s_next - 1)
+				return s_bee_car_mute ? BeeCarMute::Hook(buffer, lsn) : void();
+			Flush();
+			s_first = lsn;
+		}
+		s_next = lsn + 1;
+		++s_sectors;
+		if (s_bee_car_mute)
+			BeeCarMute::Hook(buffer, lsn);
+	}
+} // namespace DiscReadLog
 
 static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 {
@@ -1260,7 +1295,8 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 	}
 	const bool bee_car_mute = game_serial == BeeCarMute::Serial &&
 		std::find(enabled_patches.begin(), enabled_patches.end(), BeeCarMute::PatchName) != enabled_patches.end();
-	g_ps4_disc_read_hook = bee_car_mute ? BeeCarMute::Hook : nullptr;
+	DiscReadLog::s_bee_car_mute = bee_car_mute;
+	g_ps4_disc_read_hook = DiscReadLog::Hook;
 	settings->SetBoolValue("EmuCore", "EnableCheats", !enabled_cheats.empty());
 	if (enabled_cheats.empty())
 		settings->DeleteValue("Cheats", "Enable");
