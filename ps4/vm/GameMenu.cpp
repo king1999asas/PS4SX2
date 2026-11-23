@@ -383,11 +383,11 @@ namespace PS4GameMenu
 			unsigned count; // selectable values; a 4th value is display-only
 		};
 		constexpr LauncherSetting LauncherSettings[SettingCount] = {
-			{"Perfil de rendimiento", "Cambia varios ajustes a la vez. Máximo rendimiento quita lag pero puede dar fallos gráficos.",
+			{"Perfil de rendimiento", "Cambia varios ajustes a la vez. Máximo: para juegos cuya Velocidad no llega al 100%.",
 				{"Compatible", "Recomendado", "Máximo rendimiento", "Personalizado"}, 3},
-			{"Carga de CPU (EE)", "Menos carga = menos lag en juegos pesados. Si un juego va lento o raro, prueba otro nivel.",
+			{"Carga de CPU (EE)", "Bájala solo si la Velocidad (%) baja del 100. Si va al 100% y bajan los FPS, súbela.",
 				{"Normal (100%)", "Reducida (75%)", "Muy reducida (60%)", "Mínima (50%)"}, 4},
-			{"Saltar ciclos EE", "Gana velocidad en juegos lentos. Puede causar fallos en algunos juegos.",
+			{"Saltar ciclos EE", "Solo si la Velocidad baja del 100%. Con la velocidad al 100% baja los FPS del juego.",
 				{"No", "Nivel 1", "Nivel 2", "Nivel 3"}, 4},
 			{"Carga rápida de disco", "Acorta las cargas. Algunos juegos se cuelgan con esto activado.",
 				{"No", "Sí"}, 2},
@@ -497,6 +497,99 @@ namespace PS4GameMenu
 			}
 		}
 
+		// Per-game settings: the Settings markers (except the app-wide thread
+		// priority) saved per disc serial, loaded when that game starts.
+		constexpr const char* GameSettingsDirectory = "/data/PS4SX2/game-settings";
+		constexpr const char* CurrentGameFile = "/data/PS4SX2/game-settings/current.txt";
+		constexpr const char* GameMarkers[] = {"vm-ee-cycle-normal", "vm-ee-cycle-underclock", "vm-ee-cycle-minimum",
+			"vm-ee-cycle-skip", "vm-ee-cycle-skip2", "vm-ee-cycle-skip3", "vm-fast-cdvd", "vm-skip-smc",
+			"vm-gpu-readback-unsync", "vm-gpu-readback-off", "vm-blend-minimum", "vm-no-fast-boot", "vm-no-audio"};
+		struct CurrentGame
+		{
+			std::string serial;
+			std::string name;
+		};
+		std::string GameProfilePath(const std::string& serial)
+		{
+			return std::string(GameSettingsDirectory) + "/" + serial + ".txt";
+		}
+		void SaveGameProfile(const std::string& serial)
+		{
+			if (serial.empty())
+				return;
+			mkdir(GameSettingsDirectory, 0777);
+			if (FILE* file = std::fopen(GameProfilePath(serial).c_str(), "wb"))
+			{
+				for (const char* marker : GameMarkers)
+					if (Marker(marker))
+						std::fprintf(file, "%s\n", marker);
+				std::fclose(file);
+			}
+		}
+		bool LoadGameProfile(const std::string& serial)
+		{
+			FILE* file = serial.empty() ? nullptr : std::fopen(GameProfilePath(serial).c_str(), "rb");
+			if (!file)
+				return false;
+			std::vector<std::string> enabled;
+			char line[128];
+			while (std::fgets(line, sizeof(line), file))
+			{
+				std::string value(line);
+				while (!value.empty() && (value.back() == '\n' || value.back() == '\r' || value.back() == ' '))
+					value.pop_back();
+				if (!value.empty())
+					enabled.push_back(value);
+			}
+			std::fclose(file);
+			SetMarker("vm-ee-cycle-mild", false);
+			SetMarker("vm-no-fast-cdvd", false);
+			for (const char* marker : GameMarkers)
+				SetMarker(marker, std::find(enabled.begin(), enabled.end(), marker) != enabled.end());
+			return true;
+		}
+		CurrentGame LoadCurrentGame()
+		{
+			CurrentGame game;
+			if (FILE* file = std::fopen(CurrentGameFile, "rb"))
+			{
+				char line[256];
+				for (std::string* field : {&game.serial, &game.name})
+				{
+					if (!std::fgets(line, sizeof(line), file))
+						break;
+					*field = line;
+					while (!field->empty() && (field->back() == '\n' || field->back() == '\r'))
+						field->pop_back();
+				}
+				std::fclose(file);
+			}
+			return game;
+		}
+		void SaveCurrentGame(const std::string& serial, const std::string& name)
+		{
+			mkdir(GameSettingsDirectory, 0777);
+			if (FILE* file = std::fopen(CurrentGameFile, "wb"))
+			{
+				std::fprintf(file, "%s\n%s\n", serial.c_str(), name.c_str());
+				std::fclose(file);
+			}
+		}
+		// Applies a game's saved settings, or saves the current ones as its own.
+		void PrepareGameSettings(const std::string& serial, const std::string& name)
+		{
+			if (serial.empty())
+				return;
+			if (LoadGameProfile(serial))
+				ProbeLog("Game menu: per-game settings loaded for %s\n", serial.c_str());
+			else
+			{
+				SaveGameProfile(serial);
+				ProbeLog("Game menu: per-game settings created for %s from current settings\n", serial.c_str());
+			}
+			SaveCurrentGame(serial, name);
+		}
+
 		// True when /data/PS4SX2/bios contains at least one valid PS2 BIOS image.
 		bool HasBiosImage()
 		{
@@ -534,11 +627,16 @@ namespace PS4GameMenu
 			}
 			else if (view == LibraryView::Settings)
 			{
+				const CurrentGame game = LoadCurrentGame();
 				for (size_t id = 0; id < SettingCount; ++id)
 				{
 					Item item{LauncherSettings[id].name, std::string(SettingPrefix) + std::to_string(id), {}, false};
 					item.detail = LauncherSettings[id].values[std::min(GetSetting(id), id == 0 ? 3u : LauncherSettings[id].count - 1)];
 					item.name = std::string(LauncherSettings[id].name) + ": " + item.detail;
+					if (id == SettingCount - 1)
+						item.name += "  ·  todos los juegos";
+					else if (!game.name.empty())
+						item.name += "  ·  " + game.name;
 					items.push_back(std::move(item));
 				}
 			}
@@ -960,6 +1058,7 @@ namespace PS4GameMenu
 						path = PS4Disc::DevicePath;
 						platform = GamePlatform::PS2;
 						PS4Disc::Prepare(std::move(disc_probe.reader));
+						PrepareGameSettings(disc.serial, title);
 						start = true;
 						ProbeLog("Game menu: selected physical DVD %s\n", title.c_str());
 						break;
@@ -1144,9 +1243,13 @@ namespace PS4GameMenu
 					const size_t id = SettingIndex(items[selected].path);
 					const unsigned value = (GetSetting(id) + 1) % LauncherSettings[id].count;
 					SetSetting(id, value);
+					const CurrentGame game = LoadCurrentGame();
+					if (id != SettingCount - 1 && !game.serial.empty())
+						SaveGameProfile(game.serial);
 					status = std::string(LauncherSettings[id].name) + ": " + LauncherSettings[id].values[value] +
 					         (id == SettingCount - 1 ? ". Se aplica al volver a abrir PS4SX2." :
-					                                   ". Se aplica al iniciar el próximo juego.");
+					          game.name.empty() ? ". Se aplica al iniciar el próximo juego." :
+					                              ". Guardado para " + game.name + ".");
 					if (id == 0)
 						status += " Los demás ajustes se han actualizado.";
 					ProbeLog("Game menu: setting %s -> %s\n", LauncherSettings[id].name, LauncherSettings[id].values[value]);
@@ -1209,6 +1312,7 @@ namespace PS4GameMenu
 					// Consume the confirmation before handing the controller to the game.
 					while (scePadReadState(pad, &data) == 0 && data.connected && (data.buttons & ORBIS_PAD_BUTTON_CROSS))
 						Threading::Sleep(16);
+					PrepareGameSettings(items[selected].serial, items[selected].name);
 					start = true;
 					ProbeLog("Game menu: selected %s\n", path.c_str());
 					platform = items[selected].platform;
@@ -1370,7 +1474,7 @@ namespace PS4GameMenu
 			draw->AddText(font, 18.0f * scale, point(138, 205), muted, "GAME PAUSED");
 			char resolution[96];
 			std::snprintf(resolution, sizeof(resolution), "Internal resolution:  < %ux >%s", upscale,
-				upscale == 1 ? "  (native)" : "");
+				upscale == 1 ? "  (native, recomendado)" : "  (baja los FPS)");
 			static constexpr const char* aspect_names[] = {"Stretch", "Auto", "4:3", "16:9", "10:7"};
 			char aspect_label[96];
 			std::snprintf(aspect_label, sizeof(aspect_label), "Aspect ratio:  < %s >", aspect_names[std::min(aspect, 4u)]);
@@ -1440,7 +1544,7 @@ namespace PS4GameMenu
 			char hint[128];
 			std::snprintf(hint, sizeof(hint), "Left/Right: change value   |   Resolution range: 1x-%ux", max_upscale);
 		draw->AddText(font, 17.0f * scale, point(138, 756), muted, hint);
-		draw->AddText(font, 17.0f * scale, point(138, 786), muted, "3x and above is experimental and intended for PS4 Pro only.");
+		draw->AddText(font, 17.0f * scale, point(138, 786), muted, "1x recomendado en PS4 normal: 2x o más puede bajar mucho los FPS (3x-4x solo para PS4 Pro).");
 		draw->AddText(font, 17.0f * scale, point(138, 816), muted, "Up/Down: select   Left/Right: change   X: confirm   Circle: resume");
 			image("controle_x", 1480, 904, 30, 30);
 			draw->AddText(font, 20.0f * scale, point(1524, 909), white, "Confirm");
