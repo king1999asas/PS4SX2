@@ -390,7 +390,7 @@ namespace PS4GameMenu
 			unsigned count; // selectable values; a 4th value is display-only
 		};
 		constexpr LauncherSetting LauncherSettings[SettingCount] = {
-			{"Perfil de rendimiento", "Cambia varios ajustes a la vez. Máximo: para juegos cuya Velocidad no llega al 100%.",
+			{"Perfil de rendimiento", "Cambia varios ajustes a la vez. Máximo baja la carga de CPU y no toca la imagen.",
 				{"Compatible", "Recomendado", "Máximo rendimiento", "Personalizado"}, 3},
 			{"Carga de CPU (EE)", "Bájala solo si la Velocidad (%) baja del 100. Si va al 100% y bajan los FPS, súbela.",
 				{"Normal (100%)", "Reducida (75%)", "Muy reducida (60%)", "Mínima (50%)"}, 4},
@@ -400,15 +400,15 @@ namespace PS4GameMenu
 				{"No", "Sí"}, 2},
 			{"JIT rápido", "Más velocidad de CPU. Puede romper juegos como GTA San Andreas.",
 				{"No", "Sí"}, 2},
-			{"Lecturas de GPU", "Quita tirones cuando el juego lee la pantalla. Puede fallar algún efecto.",
+			{"Lecturas de GPU", "Quita tirones al leer la pantalla. Si ves negro o fallos, pon Precisas.",
 				{"Precisas", "Sin sincronizar", "Desactivadas"}, 3},
-			{"Precisión de mezcla", "Mínima alivia la GPU; algunas transparencias pueden verse peor.",
+			{"Precisión de mezcla", "Mínima solo alivia la GPU y puede estropear efectos. Mejor Básica.",
 				{"Básica", "Mínima"}, 2},
 			{"Intro de la BIOS", "Al iniciar un juego, salta o muestra la animación de la PS2.",
 				{"Saltar", "Mostrar"}, 2},
-			{"Sonido", "Desactivarlo ahorra algo de CPU en juegos muy pesados.",
+			{"Sonido", "Desactivado: el sonido no se calcula y libera algo de CPU.",
 				{"Activado", "Desactivado"}, 2},
-			{"Precisión matemática", "Rápida quita comprobaciones de cálculo (más CPU libre). Si ves fallos, vuelve a Normal.",
+			{"Precisión matemática", "Rápida libera algo de CPU pero puede dejar la pantalla en negro. Mejor Normal.",
 				{"Normal", "Rápida"}, 2},
 			{"Prioridad de hilos", "Alta evita que el sistema frene al emulador. Se aplica al volver a abrir PS4SX2.",
 				{"Alta", "Normal"}, 2},
@@ -417,13 +417,15 @@ namespace PS4GameMenu
 		};
 		bool IsGlobalSetting(size_t id) { return id >= FirstGlobalSetting; }
 		// Settings changed by the performance profile, and their values for each
-		// profile (Compatible, Recommended, Maximum).
+		// profile (Compatible, Recommended, Maximum). Maximum only lowers the EE load:
+		// the image options (GPU readbacks, blending, fast math) can break rendering
+		// and barely help here (the GPU is mostly idle), so no profile changes them.
 		constexpr size_t ProfileSettingCount = 7;
 		constexpr size_t ProfileSettings[ProfileSettingCount] = {1, 2, 3, 4, 5, 6, 9};
 		constexpr unsigned ProfileValues[3][ProfileSettingCount] = {
 			{0, 0, 0, 0, 0, 0, 0},
 			{1, 0, 0, 0, 0, 0, 0},
-			{2, 1, 1, 0, 1, 1, 1},
+			{2, 1, 0, 0, 0, 0, 0},
 		};
 		bool Marker(const char* name)
 		{
@@ -715,6 +717,98 @@ namespace PS4GameMenu
 					std::fprintf(file, "%s\n", value.c_str());
 				std::fclose(file);
 			}
+		}
+
+		// One-time fix of the saved settings ("settings v2"). The old Máximo
+		// rendimiento also switched on image options (fast math, minimum blending,
+		// unsynchronized GPU readbacks) and fast disc loading, which can leave a game
+		// on a black screen. They are removed from the live settings and from every
+		// saved game profile; the CPU options stay. Enabled 50/60 FPS patches need an
+		// EE overclock while the profiles slow the EE down, so they are switched off.
+		// The performance diagnostics (they cost CPU) are switched off too.
+		constexpr const char* SettingsVersionMarker = "settings-v2";
+		constexpr const char* RiskyMarkers[] = {"vm-fast-math", "vm-blend-minimum", "vm-gpu-readback-unsync",
+			"vm-gpu-readback-off", "vm-fast-cdvd"};
+		bool IsFrameRatePatch(const std::string& entry)
+		{
+			if (entry.size() < 3 || entry[0] != 'P')
+				return false;
+			std::string name = entry.substr(2);
+			std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+			return name.find("FPS") != std::string::npos;
+		}
+		void MigrateSettings()
+		{
+			if (Marker(SettingsVersionMarker))
+				return;
+			for (const char* marker : RiskyMarkers)
+				SetMarker(marker, false);
+			for (const char* marker : {"vm-ee-hotspots", "vm-profile-perf", "vm-profile-ee"})
+				SetMarker(marker, false);
+			u32 profiles = 0, patches = 0;
+			std::vector<std::string> names;
+			if (DIR* dir = opendir(GameSettingsDirectory))
+			{
+				while (dirent* entry = readdir(dir))
+					names.emplace_back(entry->d_name);
+				closedir(dir);
+			}
+			for (const std::string& name : names)
+			{
+				const size_t dot = name.rfind('.');
+				if (dot == std::string::npos || dot == 0 || name == "current.txt")
+					continue;
+				const std::string serial = name.substr(0, dot);
+				const std::string extension = name.substr(dot);
+				if (extension == ".txt")
+				{
+					const std::string path = GameProfilePath(serial);
+					std::vector<std::string> kept;
+					bool changed = false;
+					if (FILE* file = std::fopen(path.c_str(), "rb"))
+					{
+						char line[128];
+						while (std::fgets(line, sizeof(line), file))
+						{
+							std::string value(line);
+							while (!value.empty() && (value.back() == '\n' || value.back() == '\r' || value.back() == ' '))
+								value.pop_back();
+							if (value.empty())
+								continue;
+							const bool risky = std::any_of(std::begin(RiskyMarkers), std::end(RiskyMarkers),
+								[&](const char* marker) { return value == marker; });
+							changed |= risky;
+							if (!risky)
+								kept.push_back(std::move(value));
+						}
+						std::fclose(file);
+					}
+					if (changed)
+					{
+						if (FILE* file = std::fopen(path.c_str(), "wb"))
+						{
+							for (const std::string& value : kept)
+								std::fprintf(file, "%s\n", value.c_str());
+							std::fclose(file);
+							++profiles;
+						}
+					}
+				}
+				else if (extension == ".cheats")
+				{
+					std::vector<std::string> enabled = LoadEnabledCheats(serial);
+					const size_t before = enabled.size();
+					enabled.erase(std::remove_if(enabled.begin(), enabled.end(), IsFrameRatePatch), enabled.end());
+					if (enabled.size() != before)
+					{
+						SaveEnabledCheats(serial, enabled);
+						patches += static_cast<u32>(before - enabled.size());
+					}
+				}
+			}
+			SetMarker(SettingsVersionMarker, true);
+			ProbeLog("Settings v2: image options removed from %u game profiles, %u frame-rate patches disabled, diagnostics off\n",
+				profiles, patches);
 		}
 		std::string CheatKey(const CheatEntry& entry)
 		{
@@ -1221,6 +1315,7 @@ namespace PS4GameMenu
 		// Keep the system pic1 visible until the first Vulkan loading frame exists.
 		sceSystemServiceHideSplashScreen();
 		PlayStartupSequence();
+		MigrateSettings();
 		// (AI-assisted) Query the public release endpoint asynchronously. The
 		// launcher remains usable while DNS/HTTPS is in progress.
 		PS4Release::Start();
