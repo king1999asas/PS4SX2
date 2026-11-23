@@ -337,6 +337,15 @@ void VMHostPoll()
 					vkdev->PS4HasDeferredFlip() ? 1 : 0);
 		}
 		PS4EEHotspots::LogInterval(interval);
+		if (PS4EEHotspots::enabled && (psxRegs.pc & 0x1fffffffu) < 0x200000u)
+		{
+			// Where the IOP sits when it hands control back to the EE (diagnostics only).
+			extern u32 iopMemRead32(u32 mem);
+			const u32 start = (psxRegs.pc & ~3u) - ((psxRegs.pc & 0x1fffffffu) >= 16 ? 16u : 0u);
+			ProbeLog("IOP code: pc=%08x start=%08x words=%08x %08x %08x %08x %08x %08x %08x %08x\n", psxRegs.pc, start,
+				iopMemRead32(start), iopMemRead32(start + 4), iopMemRead32(start + 8), iopMemRead32(start + 12),
+				iopMemRead32(start + 16), iopMemRead32(start + 20), iopMemRead32(start + 24), iopMemRead32(start + 28));
+		}
 		// Read on the owning EE thread, once per heartbeat. No MMIO reads or
 		// worker calls here: observing a stalled IPU must not advance it.
 		ProbeLog("IPU state: ctrl=%08x cmd=%08x index=%d pos=%d,%d,%d,%d,%d,%d "
