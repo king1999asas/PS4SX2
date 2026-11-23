@@ -7,6 +7,7 @@
 #include "ReleaseCheck.h"
 #include "GameDatabase.h"
 #include "GameList.h"
+#include "Patch.h"
 #include "ps2/BiosTools.h"
 #include "CDVD/IsoFileFormats.h"
 #include "common/Error.h"
@@ -66,6 +67,7 @@ namespace PS4GameMenu
 			Recent,
 			Favorites,
 			Settings,
+			Cheats, // opened with OPTIONS on a game; not part of the sidebar
 		};
 		struct CoverImage
 		{
@@ -83,6 +85,8 @@ namespace PS4GameMenu
 			std::string serial;
 			GamePlatform platform = GamePlatform::Unknown;
 			std::string detail; // Settings cards: current value
+			u32 crc = 0; // ELF CRC of disc images (cheat and patch files are named SERIAL_CRC)
+			std::string help; // Cheat cards: description
 		};
 		struct CoverTexture
 		{
@@ -204,6 +208,7 @@ namespace PS4GameMenu
 			item.platform = entry.type == GameList::EntryType::PS1Disc ? GamePlatform::PS1 :
 				entry.type == GameList::EntryType::PS2Disc ? GamePlatform::PS2 : GamePlatform::Unknown;
 			item.serial = entry.serial;
+			item.crc = entry.crc;
 			std::transform(item.serial.begin(), item.serial.end(), item.serial.begin(), [](unsigned char c) {
 				return static_cast<char>(std::toupper(c));
 			});
@@ -598,7 +603,10 @@ namespace PS4GameMenu
 		void PrepareGameSettings(const std::string& serial, const std::string& name)
 		{
 			if (serial.empty())
+			{
+				SaveCurrentGame({}, {});
 				return;
+			}
 			if (LoadGameProfile(serial))
 				ProbeLog("Game menu: per-game settings loaded for %s\n", serial.c_str());
 			else
@@ -608,6 +616,249 @@ namespace PS4GameMenu
 			}
 			SaveCurrentGame(serial, name);
 		}
+
+		// ---- Cheats ("Trucos") -------------------------------------------------
+		// Cheat files live in /data/PS4SX2/cheats and patch files in
+		// /data/PS4SX2/patches, named SERIAL_CRC*.pnach like PCSX2 expects.
+		// The enabled ones are stored per game in game-settings/SERIAL.cheats
+		// ("C|name" for cheats, "P|name" for patches) and applied by main.cpp.
+		constexpr const char* CheatPrefix = "ps4sx2://cheat/";
+		constexpr const char* CheatSearchPath = "ps4sx2://cheat-search";
+		constexpr const char* CheatsDirectory = "/data/PS4SX2/cheats";
+		constexpr const char* PatchesDirectory = "/data/PS4SX2/patches";
+		// Public pnach collections, tried in order; the first hit is saved.
+		constexpr const char* CheatSources[] = {
+			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v6/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v5/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v4/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v3/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v2/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v1/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/OctopusButtons/pcsx2_cheats_collection/main/cheats/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/OctopusButtons/pcsx2_cheats_collection/main/cheats/{CRC}.pnach",
+		};
+		// Official PCSX2 game patches (widescreen, 480p, frame rate...).
+		constexpr const char* PatchSources[] = {
+			"https://raw.githubusercontent.com/PCSX2/pcsx2_patches/main/patches/{SERIAL}_{CRC}.pnach",
+		};
+		struct CheatGame
+		{
+			std::string serial;
+			std::string title;
+			u32 crc = 0;
+		};
+		struct CheatEntry
+		{
+			std::string name;
+			std::string help;
+			bool patch = false;
+		};
+		bool IsCheatPath(const std::string& path)
+		{
+			return path.rfind(CheatPrefix, 0) == 0;
+		}
+		std::string CrcText(u32 crc)
+		{
+			char text[16];
+			std::snprintf(text, sizeof(text), "%08X", crc);
+			return text;
+		}
+		std::string CheatFileStem(const CheatGame& game)
+		{
+			return game.serial + "_" + CrcText(game.crc);
+		}
+		std::string CheatListPath(const std::string& serial)
+		{
+			return std::string(GameSettingsDirectory) + "/" + serial + ".cheats";
+		}
+		std::string CheatSearchedMarker(const CheatGame& game)
+		{
+			return std::string(CheatsDirectory) + "/.searched-" + CheatFileStem(game);
+		}
+		std::vector<std::string> LoadEnabledCheats(const std::string& serial)
+		{
+			std::vector<std::string> enabled;
+			if (FILE* file = serial.empty() ? nullptr : std::fopen(CheatListPath(serial).c_str(), "rb"))
+			{
+				char line[512];
+				while (std::fgets(line, sizeof(line), file))
+				{
+					std::string value(line);
+					while (!value.empty() && (value.back() == '\n' || value.back() == '\r'))
+						value.pop_back();
+					if (value.size() > 2 && value[1] == '|')
+						enabled.push_back(std::move(value));
+				}
+				std::fclose(file);
+			}
+			return enabled;
+		}
+		void SaveEnabledCheats(const std::string& serial, const std::vector<std::string>& enabled)
+		{
+			if (serial.empty())
+				return;
+			mkdir(GameSettingsDirectory, 0777);
+			if (enabled.empty())
+			{
+				std::remove(CheatListPath(serial).c_str());
+				return;
+			}
+			if (FILE* file = std::fopen(CheatListPath(serial).c_str(), "wb"))
+			{
+				for (const std::string& value : enabled)
+					std::fprintf(file, "%s\n", value.c_str());
+				std::fclose(file);
+			}
+		}
+		std::string CheatKey(const CheatEntry& entry)
+		{
+			return std::string(entry.patch ? "P|" : "C|") + entry.name;
+		}
+		// Uses PCSX2's own pnach parser, so the list matches what the game will load.
+		std::vector<CheatEntry> LoadCheatEntries(const CheatGame& game, u32* unlabelled)
+		{
+			std::vector<CheatEntry> entries;
+			*unlabelled = 0;
+			for (const bool cheats : {true, false})
+			{
+				u32 count = 0;
+				for (const Patch::PatchInfo& info : Patch::GetPatchInfo(game.serial, game.crc, cheats, false, &count))
+				{
+					if (info.name.empty() || std::any_of(entries.begin(), entries.end(), [&](const CheatEntry& e) {
+							return e.patch == !cheats && e.name == info.name;
+						}))
+						continue;
+					CheatEntry entry{info.name, info.description, !cheats};
+					if (!info.author.empty())
+						entry.help += (entry.help.empty() ? "" : " · ") + std::string("Autor: ") + info.author;
+					entries.push_back(std::move(entry));
+				}
+				if (cheats)
+					*unlabelled += count;
+			}
+			return entries;
+		}
+		std::vector<Item> BuildCheatItems(const CheatGame& game, const std::vector<CheatEntry>& entries, bool searching)
+		{
+			std::vector<Item> items;
+			Item search{searching ? "Buscando trucos en internet..." : "Buscar trucos en internet", CheatSearchPath, {}, false};
+			search.detail = searching ? "Buscando..." : "X: buscar";
+			search.help = "Busca trucos y mejoras para " + game.serial + " / " + CrcText(game.crc) +
+			              " en bases de datos públicas de PCSX2.";
+			items.push_back(std::move(search));
+			const std::vector<std::string> enabled = LoadEnabledCheats(game.serial);
+			for (size_t i = 0; i < entries.size(); ++i)
+			{
+				const CheatEntry& entry = entries[i];
+				const bool on = std::find(enabled.begin(), enabled.end(), CheatKey(entry)) != enabled.end();
+				Item item{entry.name, std::string(CheatPrefix) + std::to_string(i), {}, false};
+				item.detail = on ? "Activado" : "Desactivado";
+				item.help = std::string(entry.patch ? "Mejora. " : "Truco. ") + entry.help;
+				items.push_back(std::move(item));
+			}
+			return items;
+		}
+		// Downloads one game's cheat and patch files in the background.
+		class CheatDownload
+		{
+		public:
+			~CheatDownload()
+			{
+				// Leaving the menu cancels the remaining sources; at most one request is waited for.
+				m_cancel.store(true);
+				if (m_active)
+					pthread_join(m_thread, nullptr);
+			}
+			bool Start(const CheatGame& game)
+			{
+				if (m_active || game.serial.empty() || game.serial.size() > 32 ||
+					game.serial.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != std::string::npos)
+					return false;
+				m_game = game;
+				m_found_cheats = m_found_patches = false;
+				m_done.store(false);
+				m_cancel.store(false);
+				pthread_attr_t attr;
+				if (pthread_attr_init(&attr) != 0)
+					return false;
+				pthread_attr_setstacksize(&attr, 1024 * 1024);
+				m_active = pthread_create(&m_thread, &attr, [](void* context) -> void* {
+					auto* job = static_cast<CheatDownload*>(context);
+					job->Run();
+					job->m_done.store(true, std::memory_order_release);
+					return nullptr;
+				}, this) == 0;
+				pthread_attr_destroy(&attr);
+				return m_active;
+			}
+			bool Collect()
+			{
+				if (!m_active || !m_done.load(std::memory_order_acquire))
+					return false;
+				pthread_join(m_thread, nullptr);
+				m_active = false;
+				return true;
+			}
+			bool Active() const { return m_active; }
+			const CheatGame& Game() const { return m_game; }
+			bool FoundCheats() const { return m_found_cheats; }
+			bool FoundPatches() const { return m_found_patches; }
+
+		private:
+			std::string Url(const char* pattern) const
+			{
+				std::string url(pattern);
+				for (const auto& [key, value] : {std::pair<std::string, std::string>{"{SERIAL}", m_game.serial},
+						 std::pair<std::string, std::string>{"{CRC}", CrcText(m_game.crc)}})
+				{
+					for (size_t at = url.find(key); at != std::string::npos; at = url.find(key, at + value.size()))
+						url.replace(at, key.size(), value);
+				}
+				return url;
+			}
+			bool Fetch(const char* const* sources, size_t count, const char* directory)
+			{
+				for (size_t i = 0; i < count && !m_cancel.load(); ++i)
+				{
+					const std::string url = Url(sources[i]);
+					std::vector<unsigned char> bytes;
+					if (!PS4CoverHttp::Get(url, "PS4SX2/1.00 cheat-search", bytes, 1024 * 1024))
+						continue;
+					const std::string text(bytes.begin(), bytes.end());
+					if (text.find("patch=") == std::string::npos)
+						continue;
+					mkdir(directory, 0777);
+					// "_internet" keeps the user's own SERIAL_CRC.pnach untouched; PCSX2 loads both.
+					const std::string path = std::string(directory) + "/" + CheatFileStem(m_game) + "_internet.pnach";
+					if (FILE* file = std::fopen(path.c_str(), "wb"))
+					{
+						std::fprintf(file, "// Descargado automáticamente por PS4SX2 de:\n// %s\n\n", url.c_str());
+						std::fwrite(text.data(), 1, text.size(), file);
+						std::fclose(file);
+						ProbeLog("Cheats: saved %s (%zu bytes) from %s\n", path.c_str(), text.size(), url.c_str());
+						return true;
+					}
+				}
+				return false;
+			}
+			void Run()
+			{
+				pthread_setname_np(pthread_self(), "PS4 cheat fetch");
+				m_found_cheats = Fetch(CheatSources, std::size(CheatSources), CheatsDirectory);
+				m_found_patches = Fetch(PatchSources, std::size(PatchSources), PatchesDirectory);
+				if (m_cancel.load())
+					return;
+				mkdir(CheatsDirectory, 0777);
+				if (FILE* file = std::fopen(CheatSearchedMarker(m_game).c_str(), "wb"))
+					std::fclose(file);
+				ProbeLog("Cheats: search %s cheats=%d patches=%d\n", CheatFileStem(m_game).c_str(),
+					m_found_cheats ? 1 : 0, m_found_patches ? 1 : 0);
+			}
+			pthread_t m_thread{};
+			std::atomic<bool> m_done{false}, m_cancel{false};
+			bool m_active = false, m_found_cheats = false, m_found_patches = false;
+			CheatGame m_game;
+		};
 
 		// True when /data/PS4SX2/bios contains at least one valid PS2 BIOS image.
 		bool HasBiosImage()
@@ -1028,12 +1279,70 @@ namespace PS4GameMenu
 				else status = "Checking physical DVD...";
 			}
 		};
+		// Cheats view state.
+		CheatGame cheat_game;
+		std::vector<CheatEntry> cheat_entries;
+		CheatDownload cheat_download;
+		LibraryView cheat_return_view = LibraryView::Library;
+		size_t cheat_return_selected = 0;
+		const auto refresh_cheats = [&](bool keep_selection) {
+			u32 unlabelled = 0;
+			cheat_entries = LoadCheatEntries(cheat_game, &unlabelled);
+			const bool searching = cheat_download.Active() && cheat_download.Game().serial == cheat_game.serial &&
+			                       cheat_download.Game().crc == cheat_game.crc;
+			items = BuildCheatItems(cheat_game, cheat_entries, searching);
+			if (!keep_selection || selected >= items.size())
+				selected = cheat_entries.empty() ? 0 : 1;
+			Publish(items, view);
+			if (unlabelled > 0)
+				ProbeLog("Cheats: %s has %u unlabelled cheat lines (always on when any cheat is enabled)\n",
+					CheatFileStem(cheat_game).c_str(), unlabelled);
+		};
+		const auto search_cheats = [&]() {
+			if (cheat_download.Active())
+				status = "Ya hay una búsqueda en marcha...";
+			else if (cheat_download.Start(cheat_game))
+				status = "Buscando trucos y mejoras para " + cheat_game.title + "...";
+			else
+				status = "No se puede buscar: este juego no tiene un serial válido.";
+		};
+		const auto open_cheats = [&](const Item& game_item) {
+			cheat_game = {game_item.serial, game_item.name, game_item.crc};
+			cheat_return_view = view;
+			cheat_return_selected = selected;
+			view = LibraryView::Cheats;
+			status = "Trucos de " + cheat_game.title + " (" + cheat_game.serial + " / " + CrcText(cheat_game.crc) + ")";
+			u32 unlabelled = 0;
+			if (LoadCheatEntries(cheat_game, &unlabelled).empty() && access(CheatSearchedMarker(cheat_game).c_str(), F_OK) != 0)
+				search_cheats();
+			refresh_cheats(false);
+			ProbeLog("Cheats: opened %s entries=%zu\n", CheatFileStem(cheat_game).c_str(), cheat_entries.size());
+		};
+		const auto close_cheats = [&]() {
+			view = cheat_return_view;
+			items = BuildView(library, view, favorites, recent);
+			selected = std::min(cheat_return_selected, items.empty() ? size_t{0} : items.size() - 1);
+			Publish(items, view);
+			status.clear();
+		};
 		// Library refreshes now begin a serialized cover queue. The UI remains
 		// responsive while each native HTTPS request completes in its own thread.
 		pump_library_cover();
 		for (;;)
 		{
 			const double now = timer.GetTimeSeconds();
+			if (cheat_download.Collect())
+			{
+				const CheatGame& found = cheat_download.Game();
+				const bool any = cheat_download.FoundCheats() || cheat_download.FoundPatches();
+				if (view == LibraryView::Cheats && found.serial == cheat_game.serial && found.crc == cheat_game.crc)
+				{
+					refresh_cheats(true);
+					status = any ? (std::to_string(cheat_entries.size()) + " trucos/mejoras para " + cheat_game.title +
+					                   ". X: activar o desactivar.") :
+					               "No se encontraron trucos en internet para " + cheat_game.title + ".";
+				}
+			}
 			if (library_cover.Collect())
 			{
 				for (Item& item : library)
@@ -1140,6 +1449,27 @@ namespace PS4GameMenu
 				Threading::Sleep(16);
 				continue;
 			}
+			if ((pressed & ORBIS_PAD_BUTTON_CIRCLE) && view == LibraryView::Cheats)
+			{
+				close_cheats();
+				Present(selected, status, connected, false, false, false);
+				Threading::Sleep(16);
+				continue;
+			}
+			if ((pressed & ORBIS_PAD_BUTTON_OPTIONS) && !sidebar_focused &&
+				(view == LibraryView::Library || view == LibraryView::Recent || view == LibraryView::Favorites) &&
+				selected < items.size())
+			{
+				const Item game_item = items[selected]; // copy: opening the view replaces items
+				if (game_item.platform == GamePlatform::PS2 && !game_item.serial.empty() && game_item.crc != 0)
+				{
+					open_cheats(game_item);
+					Present(selected, status, connected, false, false, false);
+					Threading::Sleep(16);
+					continue;
+				}
+				status = "Los trucos solo están disponibles para juegos de PS2 con serial detectado.";
+			}
 			if (pressed & ORBIS_PAD_BUTTON_CIRCLE)
 			{
 				boot_disc_when_ready = false;
@@ -1149,7 +1479,12 @@ namespace PS4GameMenu
 				Threading::Sleep(16);
 				continue;
 			}
-			if ((pressed & ORBIS_PAD_BUTTON_TRIANGLE) && view == LibraryView::Disc)
+			if ((pressed & ORBIS_PAD_BUTTON_TRIANGLE) && view == LibraryView::Cheats)
+			{
+				search_cheats();
+				refresh_cheats(true);
+			}
+			else if ((pressed & ORBIS_PAD_BUTTON_TRIANGLE) && view == LibraryView::Disc)
 				probe_disc(false);
 			else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE)
 			{
@@ -1163,7 +1498,7 @@ namespace PS4GameMenu
 				Publish(items, view);
 				status.clear();
 			}
-			if (pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1))
+			if ((pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) && view != LibraryView::Cheats)
 			{
 				constexpr unsigned view_count = 5;
 				unsigned next = static_cast<unsigned>(view);
@@ -1208,7 +1543,7 @@ namespace PS4GameMenu
 					const size_t row = selected / GridColumns;
 					const size_t row_count = (items.size() + GridColumns - 1) / GridColumns;
 					if (navigation == ORBIS_PAD_BUTTON_LEFT && column == 0)
-						sidebar_focused = true;
+						sidebar_focused = view != LibraryView::Cheats;
 					else if (navigation == ORBIS_PAD_BUTTON_LEFT)
 						--selected;
 					else if (navigation == ORBIS_PAD_BUTTON_RIGHT && column + 1 < GridColumns && selected + 1 < items.size())
@@ -1225,7 +1560,8 @@ namespace PS4GameMenu
 			if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !sidebar_focused && view != LibraryView::Disc)
 			{
 				const std::string selected_path = items[selected].path;
-				if (!selected_path.empty() && selected_path != BiosEntryPath && !IsSettingPath(selected_path))
+				if (!selected_path.empty() && selected_path != BiosEntryPath && !IsSettingPath(selected_path) &&
+					view != LibraryView::Cheats)
 				{
 					const auto found = std::find(favorites.begin(), favorites.end(), selected_path);
 					const bool removing = found != favorites.end();
@@ -1253,6 +1589,34 @@ namespace PS4GameMenu
 				{
 					// Re-probe before launch, so an ejected/replaced DVD cannot use old metadata.
 					probe_disc(true);
+					Present(selected, status, connected, false, false, false);
+					Threading::Sleep(16);
+					continue;
+				}
+				if (view == LibraryView::Cheats)
+				{
+					if (items[selected].path == CheatSearchPath)
+						search_cheats();
+					else if (IsCheatPath(items[selected].path))
+					{
+						const size_t index = std::strtoul(items[selected].path.c_str() + std::strlen(CheatPrefix), nullptr, 10);
+						if (index < cheat_entries.size())
+						{
+							const std::string key = CheatKey(cheat_entries[index]);
+							std::vector<std::string> enabled = LoadEnabledCheats(cheat_game.serial);
+							const auto found = std::find(enabled.begin(), enabled.end(), key);
+							const bool on = found == enabled.end();
+							if (on)
+								enabled.push_back(key);
+							else
+								enabled.erase(found);
+							SaveEnabledCheats(cheat_game.serial, enabled);
+							status = cheat_entries[index].name + (on ? ": activado." : ": desactivado.") +
+							         " Se aplica al iniciar el juego.";
+							ProbeLog("Cheats: %s %s -> %d\n", cheat_game.serial.c_str(), key.c_str(), on ? 1 : 0);
+						}
+					}
+					refresh_cheats(true);
 					Present(selected, status, connected, false, false, false);
 					Threading::Sleep(16);
 					continue;
@@ -1294,6 +1658,7 @@ namespace PS4GameMenu
 						while (scePadReadState(pad, &data) == 0 && data.connected && (data.buttons & ORBIS_PAD_BUTTON_CROSS))
 							Threading::Sleep(16);
 						// Empty path = boot the BIOS with no disc (main.cpp uses CDVD_SourceType::NoDisc).
+						SaveCurrentGame({}, {});
 						path.clear();
 						platform = GamePlatform::PS2;
 						start = true;
@@ -1743,6 +2108,20 @@ namespace PS4GameMenu
 					draw->AddText(font, 17 * scale, point(x + 22, y + 210), muted, setting.help, nullptr, (card_w - 44) * scale);
 					text(x + 22, y + card_h - 22, 16, faint, "X: cambiar");
 				}
+				else if (IsCheatPath(s_items[index].path) || s_items[index].path == CheatSearchPath)
+				{
+					const bool on = s_items[index].detail == "Activado";
+					fill(x + 2, y + 2, card_w - 4, card_h - 4, focused ? IM_COL32(18, 53, 86, 255) : card_bg, 7);
+					draw->AddText(font, 23 * scale, point(x + 22, y + 26), white, s_items[index].name.c_str(), nullptr,
+						(card_w - 44) * scale);
+					fill(x + 20, y + 140, card_w - 40, 60, on ? IM_COL32(46, 170, 92, focused ? 255 : 190) :
+						IM_COL32(45, 153, 255, focused ? 255 : 150), 12);
+					centered_text(x + card_w * 0.5f, y + 180, 21, white, s_items[index].detail.c_str());
+					draw->AddText(font, 16 * scale, point(x + 22, y + 226), muted, s_items[index].help.c_str(), nullptr,
+						(card_w - 44) * scale);
+					text(x + 22, y + card_h - 22, 16, faint,
+						s_items[index].path == CheatSearchPath ? "X: buscar" : "X: activar / desactivar");
+				}
 				else if (s_items[index].path == BiosEntryPath)
 				{
 					text(x + 24, y + card_h - 74, 24, white, "Menú de PS2");
@@ -1765,9 +2144,17 @@ namespace PS4GameMenu
 		}
 		if (!s_status.empty())
 			text(346, 936, 17, accent, fit(s_status, 17, 1496).c_str());
+		const bool cheats_view = s_library_view == LibraryView::Cheats;
 		image("controle_x", 346, 1001, 30, 30);
-		text(384, 1023, 16, white, "Start");
-		if (!disc_view)
+		text(384, 1023, 16, white, cheats_view ? "Cambiar" : "Start");
+		if (cheats_view)
+		{
+			image("controle_triangulo", 500, 1001, 30, 30);
+			text(538, 1023, 16, white, "Buscar en internet");
+			image("controle_bola", 760, 1001, 30, 30);
+			text(798, 1023, 16, white, "Volver");
+		}
+		else if (!disc_view)
 		{
 			image("controle_quadrado", 500, 1001, 30, 30);
 			text(538, 1023, 16, current.path.empty() || current.path == BiosEntryPath || IsSettingPath(current.path) ? muted : white,
@@ -1776,10 +2163,18 @@ namespace PS4GameMenu
 		// Disc has no favorite action: use the next Library slots without an empty gap.
 		const float refresh_x = disc_view ? 500.0f : 760.0f;
 		const float exit_x = disc_view ? 760.0f : 1035.0f;
-		image("controle_triangulo", refresh_x, 1001, 30, 30);
-		text(refresh_x + 38, 1023, 16, white, disc_view ? "Refresh disc" : "Refresh library");
-		image("controle_bola", exit_x, 1001, 30, 30);
-		text(exit_x + 38, 1023, 16, muted, "Exit");
+		if (!cheats_view)
+		{
+			image("controle_triangulo", refresh_x, 1001, 30, 30);
+			text(refresh_x + 38, 1023, 16, white, disc_view ? "Refresh disc" : "Refresh library");
+			image("controle_bola", exit_x, 1001, 30, 30);
+			text(exit_x + 38, 1023, 16, muted, "Exit");
+		}
+		if (!cheats_view && !disc_view && s_library_view != LibraryView::Settings)
+		{
+			image("controle_options", 1230, 1001, 45, 32);
+			text(1284, 1023, 16, current.platform == GamePlatform::PS2 && current.crc != 0 ? white : muted, "Trucos");
+		}
 		if (s_exit_dialog_visible)
 		{
 			draw->AddRectFilled(ImVec2(0, 0), size, IM_COL32(0, 0, 0, 165));
