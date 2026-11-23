@@ -68,6 +68,8 @@ extern bool g_ps4_vtlb_register_cache;
 extern bool g_ps4_vtlb_bulk_register_cache;
 extern bool g_ps4_skip_smc_checks;
 extern bool g_ps4_bytecopy_fusion;
+extern bool g_ps4_bytefill_fusion;
+extern u64 g_ps4_bytefill_blocks, g_ps4_bytefill_runs, g_ps4_bytefill_bytes, g_ps4_bytefill_declined;
 extern std::atomic<int> g_orbis_waitloop_ext;
 extern u64 g_ps4_vtlb_cached_quad_reads, g_ps4_vtlb_cached_writes;
 extern u64 g_ps4_multiblock_wait_blocks, g_ps4_multiblock_wait_runs, g_ps4_multiblock_wait_iterations;
@@ -521,6 +523,11 @@ void VMHostPoll()
 			static_cast<unsigned long long>(g_ps4_bytecopy_state),
 			static_cast<unsigned long long>(g_ps4_bytecopy_scratch),
 			g_ps4_bytecopy_last_source, g_ps4_bytecopy_last_destination);
+		ProbeLog("EE byte-fill fusion cumulative: blocks=%llu runs=%llu bytes=%llu declined=%llu\n",
+			static_cast<unsigned long long>(g_ps4_bytefill_blocks),
+			static_cast<unsigned long long>(g_ps4_bytefill_runs),
+			static_cast<unsigned long long>(g_ps4_bytefill_bytes),
+			static_cast<unsigned long long>(g_ps4_bytefill_declined));
 #endif
 	}
 	// (AI-assisted) Even when heartbeat throttled, keep a 1s paused tick visible. Needs proper testing.
@@ -826,6 +833,7 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 	g_ps4_skip_smc_checks = access("/data/PS4SX2/vm-skip-smc", F_OK) == 0;
 	g_ps4_bytecopy_fusion = g_ps4_skip_smc_checks && access("/data/PS4SX2/vm-no-bytecopy-fusion", F_OK) != 0;
+	g_ps4_bytefill_fusion = access("/data/PS4SX2/vm-no-bytefill-fusion", F_OK) != 0;
 #endif
 	VMManager::ApplySettings();
 	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d readback=%d minBlend=%d fastMath=%d\n",
@@ -1027,6 +1035,10 @@ static void* RunVM(void*)
 	g_ps4_bytecopy_last_source = g_ps4_bytecopy_last_destination = 0;
 	ProbeLog("EE byte-copy fusion: %s (disable with /data/PS4SX2/vm-no-bytecopy-fusion)\n",
 		g_ps4_bytecopy_fusion ? "enabled with inline deadline gate, mapped RAM batches and native fallback" : "disabled by marker or exact SMC checks");
+	g_ps4_bytefill_fusion = access("/data/PS4SX2/vm-no-bytefill-fusion", F_OK) != 0;
+	g_ps4_bytefill_blocks = g_ps4_bytefill_runs = g_ps4_bytefill_bytes = g_ps4_bytefill_declined = 0;
+	ProbeLog("EE byte-fill fusion: %s (disable with /data/PS4SX2/vm-no-bytefill-fusion)\n",
+		g_ps4_bytefill_fusion ? "enabled (memset byte loops run natively, page and event bounded)" : "disabled by marker");
 #endif
 	// (AI-assisted) This process has never initialized Piglet. The recovery
 	// selector and the VM share only the Vulkan backend on the GS thread.
@@ -1060,6 +1072,7 @@ static void* RunVM(void*)
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 		g_ps4_skip_smc_checks = false;
 		g_ps4_bytecopy_fusion = false;
+		g_ps4_bytefill_fusion = false;
 		g_ps4_vtlb_register_cache = false;
 		g_ps4_vtlb_bulk_register_cache = false;
 		g_orbis_waitloop_ext.store(0, std::memory_order_relaxed);
