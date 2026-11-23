@@ -626,7 +626,8 @@ namespace PS4GameMenu
 		constexpr const char* CheatSearchPath = "ps4sx2://cheat-search";
 		constexpr const char* CheatsDirectory = "/data/PS4SX2/cheats";
 		constexpr const char* PatchesDirectory = "/data/PS4SX2/patches";
-		// Public pnach collections, tried in order; the first hit is saved.
+		// Public pnach collections, tried in order; the first hit is saved (one
+		// file per type, so two sources never apply conflicting codes).
 		constexpr const char* CheatSources[] = {
 			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v6/{SERIAL}_{CRC}.pnach",
 			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v5/{SERIAL}_{CRC}.pnach",
@@ -636,10 +637,15 @@ namespace PS4GameMenu
 			"https://raw.githubusercontent.com/XiGuanChi/PCSX2-CheatsDB/main/cheats-v1/{SERIAL}_{CRC}.pnach",
 			"https://raw.githubusercontent.com/OctopusButtons/pcsx2_cheats_collection/main/cheats/{SERIAL}_{CRC}.pnach",
 			"https://raw.githubusercontent.com/OctopusButtons/pcsx2_cheats_collection/main/cheats/{CRC}.pnach",
+			"https://raw.githubusercontent.com/heavyjam-code/pcsx2-cheats-n-patches/main/cheats/{SERIAL}_{CRC}.pnach",
 		};
-		// Official PCSX2 game patches (widescreen, 480p, frame rate...).
+		// Game patches (widescreen, 480p, frame rate...): official PCSX2 first,
+		// then the authors' own collections (PeterDelta's has Spanish descriptions).
 		constexpr const char* PatchSources[] = {
 			"https://raw.githubusercontent.com/PCSX2/pcsx2_patches/main/patches/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/PeterDelta/PCSX2/main/descripcion%20traducida/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/Gabominated/PCSX2/main/PCSX2%20Patches/{SERIAL}_{CRC}.pnach",
+			"https://raw.githubusercontent.com/heavyjam-code/pcsx2-cheats-n-patches/main/patches/{SERIAL}_{CRC}.pnach",
 		};
 		struct CheatGame
 		{
