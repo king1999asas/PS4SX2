@@ -59,6 +59,11 @@
 #include <cmath>
 #include <dirent.h>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <cstring>
+#include <ctime>
+#include <pthread.h>
 
 static int s_log = -1;
 
@@ -153,23 +158,295 @@ static double s_last_log = -5.0;
 static double s_last_input = -1.0;
 static double s_last_pause_log = -5.0;
 
-// (fork) One copy of the last game session's log on the USB drive, readable on a PC
-// without FTP: /mnt/usbN/logs/PS4SX2-registro.txt, rewritten every 30 s while a game
-// runs and once more on exit (a crash or a forced close keeps the last copy). The
-// old copies of the separate log files in that folder are deleted, so only this
-// file remains. Menu-only sessions never touch the USB.
+// (fork) One file on the USB drive to review play sessions on a PC without FTP:
+// /mnt/usbN/logs/PS4SX2-registro.txt. It starts with a short summary of the last
+// game sessions (game, settings, speed, FPS and what held it back), so several
+// setting combinations can be compared, and then holds the full log of the most
+// recent session. It is rewritten every 30 s by a worker thread while a game runs
+// and once more on exit (a crash or a forced close keeps the last copy, and its
+// summary is kept on the next start). The old copies of the separate log files
+// in that folder are deleted, so only this file remains. Menu-only sessions never
+// touch the USB.
 static bool s_game_session = false;
 static double s_last_usb_copy = 0.0;
+
+namespace SessionSummary
+{
+	constexpr const char* HistoryPath = "/data/PS4SX2/session-history.txt";
+	constexpr const char* CurrentPath = "/data/PS4SX2/session-current.txt";
+	constexpr const char* Separator = "------------------------------------------------------------\n";
+	constexpr size_t MaxHistory = 10;
+
+	struct Sample
+	{
+		float t, speed, fps, ee, gs, vu1, gpu;
+	};
+	static std::mutex s_mutex;
+	static std::vector<Sample> s_samples;
+	static std::vector<float> s_marks;
+	static Common::Timer::Value s_start = 0;
+	static std::string s_title, s_serial, s_date;
+	static std::string s_settings = "Ajustes: no registrados\n";
+	static bool s_active = false;
+
+	static float Elapsed() // caller holds s_mutex
+	{
+		return s_start ? static_cast<float>(Common::Timer::ConvertValueToSeconds(Common::Timer::GetCurrentValue() - s_start)) : 0.0f;
+	}
+
+	static std::string ReadFile(const char* path)
+	{
+		std::string text;
+		const int fd = open(path, O_RDONLY);
+		if (fd < 0)
+			return text;
+		char buffer[4096];
+		ssize_t n;
+		while ((n = read(fd, buffer, sizeof(buffer))) > 0)
+			text.append(buffer, static_cast<size_t>(n));
+		close(fd);
+		return text;
+	}
+
+	static void WriteFile(const char* path, const std::string& text)
+	{
+		const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (fd < 0)
+			return;
+		if (!text.empty())
+			(void)!write(fd, text.data(), text.size());
+		close(fd);
+	}
+
+	// Keeps the last MaxHistory entries, each followed by Separator.
+	static void AppendHistory(const std::string& entry)
+	{
+		if (entry.empty())
+			return;
+		const std::string history = ReadFile(HistoryPath);
+		std::vector<std::string> entries;
+		for (size_t begin = 0; begin < history.size();)
+		{
+			const size_t end = history.find(Separator, begin);
+			if (end == std::string::npos)
+				break;
+			entries.push_back(history.substr(begin, end - begin));
+			begin = end + std::strlen(Separator);
+		}
+		entries.push_back(entry);
+		const size_t first = entries.size() > MaxHistory ? entries.size() - MaxHistory : 0;
+		std::string text;
+		for (size_t i = first; i < entries.size(); ++i)
+			text += entries[i] + Separator;
+		WriteFile(HistoryPath, text);
+	}
+
+	// A session that ended without going through the menu (PS button, crash) left
+	// its last snapshot behind; keep it in the history.
+	static void KeepLeftover()
+	{
+		const std::string leftover = ReadFile(CurrentPath);
+		if (!leftover.empty())
+			AppendHistory(leftover);
+		unlink(CurrentPath);
+	}
+
+	static void Begin()
+	{
+		std::lock_guard lock(s_mutex);
+		s_samples.clear();
+		s_marks.clear();
+		s_start = Common::Timer::GetCurrentValue();
+		const time_t now = time(nullptr);
+		struct tm local{};
+		char date[32] = "";
+		if (localtime_r(&now, &local))
+			strftime(date, sizeof(date), "%d/%m/%Y %H:%M", &local);
+		s_date = date;
+		s_active = true;
+	}
+
+	static void RefreshGame()
+	{
+		std::string title = VMManager::GetTitle(true);
+		std::string serial = VMManager::GetDiscSerial();
+		std::lock_guard lock(s_mutex);
+		if (!title.empty())
+			s_title = std::move(title);
+		if (!serial.empty())
+			s_serial = std::move(serial);
+	}
+
+	static void Mark()
+	{
+		std::lock_guard lock(s_mutex);
+		if (s_active && s_marks.size() < 64)
+			s_marks.push_back(Elapsed());
+	}
+
+	static void Add(double speed, double fps, double ee, double gs, double vu1, double gpu)
+	{
+		std::lock_guard lock(s_mutex);
+		if (!s_active || speed < 1.0 || s_samples.size() >= 8192)
+			return; // paused, or more than 11 hours
+		s_samples.push_back({Elapsed(), static_cast<float>(speed), static_cast<float>(fps), static_cast<float>(ee),
+			static_cast<float>(gs), static_cast<float>(vu1), static_cast<float>(gpu)});
+	}
+
+	static void SetSettings(int ee_rate, int ee_skip, bool fast_cdvd, bool fast_boot, bool audio, int download_mode,
+		bool min_blend, bool fast_math, const std::vector<std::string>& patches, const std::vector<std::string>& cheats)
+	{
+		const auto marker = [](const char* name) {
+			return access((std::string("/data/PS4SX2/") + name).c_str(), F_OK) == 0;
+		};
+		const bool fast_jit = marker("vm-skip-smc");
+		const unsigned readback = download_mode == static_cast<int>(GSHardwareDownloadMode::Disabled) ? 2u :
+		                          download_mode == static_cast<int>(GSHardwareDownloadMode::Unsynchronized) ? 1u : 0u;
+		// Same rule as the launcher's "Perfil de rendimiento".
+		const unsigned values[7] = {marker("vm-ee-cycle-normal") ? 0u : marker("vm-ee-cycle-minimum") ? 3u :
+		                            marker("vm-ee-cycle-underclock") ? 2u : 1u,
+			static_cast<unsigned>(ee_skip), fast_cdvd ? 1u : 0u, fast_jit ? 1u : 0u, readback, min_blend ? 1u : 0u,
+			fast_math ? 1u : 0u};
+		static constexpr unsigned profiles[3][7] = {{0, 0, 0, 0, 0, 0, 0}, {1, 0, 0, 0, 0, 0, 0}, {2, 1, 0, 0, 0, 0, 0}};
+		static constexpr const char* profile_names[4] = {"Compatible", "Recomendado", "Máximo rendimiento", "Personalizado"};
+		unsigned profile = 3;
+		for (unsigned p = 0; p < 3 && profile == 3; ++p)
+			profile = std::equal(values, values + 7, profiles[p]) ? p : 3;
+		const char* ee = ee_rate == 0 ? "100%" : ee_rate == -1 ? "75%" : ee_rate == -2 ? "60%" : ee_rate == -3 ? "50%" : "?";
+		static constexpr const char* readback_names[3] = {"precisas", "sin sincronizar", "desactivadas"};
+		const auto join = [](const std::vector<std::string>& list) {
+			std::string text;
+			for (const std::string& item : list)
+				text += (text.empty() ? "" : ", ") + item;
+			return text.empty() ? std::string("ninguno") : text;
+		};
+		char line[512];
+		std::snprintf(line, sizeof(line),
+			"Ajustes: perfil %s · CPU EE %s · saltar ciclos %s · carga rápida %s · JIT rápido %s · lecturas GPU %s · "
+			"mezcla %s · matemáticas %s · sonido %s · intro BIOS %s\n",
+			profile_names[profile], ee, ee_skip == 0 ? "no" : ee_skip == 1 ? "nivel 1" : ee_skip == 2 ? "nivel 2" : "nivel 3",
+			fast_cdvd ? "sí" : "no", fast_jit ? "sí" : "no", readback_names[readback], min_blend ? "mínima" : "básica",
+			fast_math ? "rápida" : "normal", audio ? "sí" : "no", fast_boot ? "saltar" : "mostrar");
+		std::string text = line;
+		text += "Parches: " + join(patches) + " · Trucos: " + join(cheats) + "\n";
+		std::lock_guard lock(s_mutex);
+		s_settings = std::move(text);
+	}
+
+	static std::string Build(const char* status) // caller holds s_mutex
+	{
+		std::string out;
+		char line[640];
+		const int seconds = static_cast<int>(Elapsed());
+		std::snprintf(line, sizeof(line), "Partida: %s (%s) · %s · %d min %02d s · %s\n",
+			s_title.empty() ? "juego desconocido" : s_title.c_str(), s_serial.empty() ? "?" : s_serial.c_str(),
+			s_date.c_str(), seconds / 60, seconds % 60, status);
+		out += line;
+		out += s_settings;
+		if (s_samples.empty())
+			out += "Rendimiento: sin datos todavía\n";
+		else
+		{
+			double speed = 0, fps = 0, ee = 0, gs = 0, vu1 = 0, gpu = 0;
+			float min_speed = 1000.0f;
+			size_t full = 0, slow = 0, limits[3] = {0, 0, 0};
+			for (const Sample& s : s_samples)
+			{
+				speed += s.speed;
+				fps += s.fps;
+				ee += s.ee;
+				gs += s.gs;
+				vu1 += s.vu1;
+				gpu += s.gpu;
+				min_speed = std::min(min_speed, s.speed);
+				full += s.speed >= 97.0f;
+				if (s.speed < 95.0f)
+				{
+					++slow;
+					const float busiest = std::max({s.ee, s.gs, s.vu1});
+					if (busiest >= 85.0f)
+						++limits[busiest == s.ee ? 0 : busiest == s.gs ? 1 : 2];
+				}
+			}
+			const double n = static_cast<double>(s_samples.size());
+			std::snprintf(line, sizeof(line),
+				"Resultado: velocidad media %.0f%% (mínima %.0f%%, a velocidad completa el %.0f%% del tiempo) · FPS medios %.0f\n"
+				"Uso medio: procesador EE %.0f%% · gráficos GS %.0f%% · VU1 %.0f%% · GPU %.0f%%\n",
+				speed / n, static_cast<double>(min_speed), 100.0 * full / n, fps / n, ee / n, gs / n, vu1 / n, gpu / n);
+			out += line;
+			if (slow == 0)
+				out += "Freno: ninguno, no baja del 95%\n";
+			else
+			{
+				static constexpr const char* limit_names[3] = {"procesador (EE)", "gráficos (GS)", "gráficos (VU1)"};
+				const size_t worst = static_cast<size_t>(std::max_element(limits, limits + 3) - limits);
+				if (limits[worst] == 0)
+					std::snprintf(line, sizeof(line), "Freno cuando va lento (%.0f%% del tiempo): ningún hilo al límite\n", 100.0 * slow / n);
+				else
+					std::snprintf(line, sizeof(line), "Freno cuando va lento (%.0f%% del tiempo): %s, en el %.0f%% de esos momentos\n",
+						100.0 * slow / n, limit_names[worst], 100.0 * limits[worst] / slow);
+				out += line;
+			}
+			// Speed and FPS per minute (per few minutes in long sessions), to tell menus,
+			// videos and gameplay apart.
+			const int step = std::max(1, (seconds + 40 * 60 - 1) / (40 * 60));
+			std::snprintf(line, sizeof(line), "Cada %d min (minuto: velocidad%%/FPS):", step);
+			out += line;
+			const int buckets = s_samples.back().t / (60.0f * step) + 1;
+			size_t index = 0;
+			for (int bucket = 0; bucket < buckets; ++bucket)
+			{
+				double bucket_speed = 0, bucket_fps = 0;
+				size_t count = 0;
+				for (; index < s_samples.size() && s_samples[index].t < (bucket + 1) * 60.0f * step; ++index, ++count)
+				{
+					bucket_speed += s_samples[index].speed;
+					bucket_fps += s_samples[index].fps;
+				}
+				if (count == 0)
+					continue;
+				std::snprintf(line, sizeof(line), " %d:%.0f/%.0f", bucket * step + 1, bucket_speed / count, bucket_fps / count);
+				out += line;
+			}
+			out += "\n";
+		}
+		if (!s_marks.empty())
+		{
+			out += "Menú L3+R3 abierto en (min:seg):";
+			for (const float mark : s_marks)
+			{
+				std::snprintf(line, sizeof(line), " %d:%02d", static_cast<int>(mark) / 60, static_cast<int>(mark) % 60);
+				out += line;
+			}
+			out += "\n";
+		}
+		return out;
+	}
+} // namespace SessionSummary
+
+void PS4SessionStatsAdd(double speed, double fps, double ee, double gs, double vu1, double gpu)
+{
+	SessionSummary::Add(speed, fps, ee, gs, vu1, gpu);
+}
+
 namespace UsbLog
 {
 	constexpr const char* FileName = "PS4SX2-registro.txt";
 	constexpr const char* SourcePath = "/data/PS4SX2/logs/PCSX2-vm-boot.log";
-	std::atomic<bool> s_busy{false};
-	bool s_cleaned = false;
-	bool s_reported = false;
-	char s_buffer[64 * 1024]; // used only by the copy that holds s_busy
+	static std::mutex s_copy_mutex; // held while the USB file is written
+	static std::mutex s_request_mutex;
+	static std::condition_variable s_request_cv;
+	static bool s_requested = false;
+	static std::string s_requested_entry, s_requested_leftover;
+	static std::atomic<bool> s_closing{false};
+	static bool s_thread_tried = false;
+	static int s_thread_result = -1;
+	static bool s_cleaned = false;
+	static int s_last_state = 0;
+	static char s_buffer[64 * 1024]; // used only under s_copy_mutex
 
-	std::string FindTargetDir()
+	// First writable /mnt/usbN/logs; otherwise empty, with what was found in why.
+	static std::string FindTargetDir(std::string& why)
 	{
 		for (int i = 0; i < 8; ++i)
 		{
@@ -177,16 +454,21 @@ namespace UsbLog
 			std::snprintf(root, sizeof(root), "/mnt/usb%d", i);
 			struct stat st{};
 			if (stat(root, &st) != 0 || !S_ISDIR(st.st_mode))
+			{
+				if (i == 0 || errno != ENOENT)
+					why += std::string(" ") + root + " errno=" + std::to_string(errno);
 				continue;
+			}
 			const std::string dir = std::string(root) + "/logs";
 			mkdir(dir.c_str(), 0777);
 			if (stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && access(dir.c_str(), W_OK) == 0)
 				return dir;
+			why += " " + dir + " errno=" + std::to_string(errno);
 		}
 		return {};
 	}
 
-	void RemoveOldCopies(const std::string& dir)
+	static void RemoveOldCopies(const std::string& dir)
 	{
 		static constexpr const char* files[] = {"PCSX2-vm-boot.log", "PCSX2-vm-stdout.log", "PCSX2-vm-stderr.log",
 			"emulog.txt", "session-platform.txt", "xmb-trace.log", "legacy-xmb-trace.log"};
@@ -200,33 +482,44 @@ namespace UsbLog
 		}
 	}
 
-	// Caller holds s_busy.
-	long long CopyNow()
+	// Summary of the last sessions (and of the current one, if given), then the
+	// full log. Caller holds s_copy_mutex. Returns 1 on success, or <0 on failure.
+	static int CopyNow(const std::string& current_entry, std::string& why)
 	{
-		const std::string dir = FindTargetDir();
+		const std::string dir = FindTargetDir(why);
 		if (dir.empty())
 			return -1;
 		const int in = open(SourcePath, O_RDONLY);
 		if (in < 0)
-			return -1;
+		{
+			why = " " + std::string(SourcePath) + " errno=" + std::to_string(errno);
+			return -2;
+		}
 		const std::string target = dir + "/" + FileName;
 		const int out = open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
 		if (out < 0)
 		{
+			why = " " + target + " errno=" + std::to_string(errno);
 			close(in);
-			return -1;
+			return -3;
 		}
-		long long total = 0;
+		std::string header = "\xEF\xBB\xBFPS4SX2 · registro para revisar en el PC\n\n"
+		                     "RESUMEN DE LAS ÚLTIMAS PARTIDAS (la más reciente al final)\n";
+		header += SessionSummary::Separator;
+		header += SessionSummary::ReadFile(SessionSummary::HistoryPath);
+		if (!current_entry.empty())
+			header += current_entry + SessionSummary::Separator;
+		header += "\nREGISTRO COMPLETO DE LA PARTIDA MÁS RECIENTE\n";
+		header += SessionSummary::Separator;
+		int result = write(out, header.data(), header.size()) == static_cast<ssize_t>(header.size()) ? 1 : -4;
 		ssize_t n;
-		while ((n = read(in, s_buffer, sizeof(s_buffer))) > 0)
+		while (result > 0 && (n = read(in, s_buffer, sizeof(s_buffer))) > 0)
 		{
 			if (write(out, s_buffer, static_cast<size_t>(n)) != n)
-			{
-				total = -1;
-				break;
-			}
-			total += n;
+				result = -4;
 		}
+		if (result < 0)
+			why = " " + target + " write errno=" + std::to_string(errno);
 		close(in);
 		fsync(out);
 		close(out);
@@ -235,54 +528,106 @@ namespace UsbLog
 			RemoveOldCopies(dir);
 			s_cleaned = true;
 		}
-		return total;
+		if (result > 0)
+			why = target;
+		return result;
 	}
 
-	void* CopyThread(void*)
+	// Logs the outcome when it changes (first copy, USB plugged or removed).
+	static void Report(int state, const std::string& why)
 	{
-		const long long bytes = CopyNow();
-		if (!s_reported)
+		if (state == s_last_state)
+			return;
+		s_last_state = state;
+		if (state > 0)
+			ProbeLog("USB log: summary and log copied to %s every 30 s\n", why.c_str());
+		else if (state == -1)
+			ProbeLog("USB log: no writable USB drive found (/mnt/usb0-7):%s\n", why.c_str());
+		else
+			ProbeLog("USB log: copy failed (%d):%s\n", state, why.c_str());
+	}
+
+	static void* Worker(void*)
+	{
+		for (;;)
 		{
-			s_reported = true;
-			if (bytes >= 0)
-				ProbeLog("USB log: copying this session's log to %s/%s every 30 s\n", FindTargetDir().c_str(), FileName);
-			else
-				ProbeLog("USB log: no writable USB drive found (/mnt/usb0-7); log copy skipped\n");
+			std::string entry, leftover;
+			{
+				std::unique_lock lock(s_request_mutex);
+				s_request_cv.wait(lock, [] { return s_requested; });
+				s_requested = false;
+				entry.swap(s_requested_entry);
+				leftover.swap(s_requested_leftover);
+			}
+			std::lock_guard copy_lock(s_copy_mutex);
+			if (s_closing.load(std::memory_order_acquire))
+				continue;
+			SessionSummary::WriteFile(SessionSummary::CurrentPath, leftover);
+			std::string why;
+			Report(CopyNow(entry, why), why);
 		}
-		s_busy.store(false, std::memory_order_release);
 		return nullptr;
 	}
 
-	// Copies in a background thread; skipped if a copy is still running.
-	void CopyAsync()
+	// From the EE thread: snapshot the current session and copy it in the background.
+	static void Request()
 	{
-		bool expected = false;
-		if (!s_busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+		std::string entry, leftover;
+		{
+			std::lock_guard lock(SessionSummary::s_mutex);
+			entry = SessionSummary::Build("en curso");
+			leftover = SessionSummary::Build("cerrada sin salir desde el menú (botón PS o cuelgue)");
+		}
+		if (!s_thread_tried)
+		{
+			s_thread_tried = true;
+			pthread_attr_t attr;
+			s_thread_result = pthread_attr_init(&attr);
+			if (s_thread_result == 0)
+			{
+				s_thread_result = pthread_attr_setstacksize(&attr, 256 * 1024);
+				pthread_t thread;
+				if (s_thread_result == 0)
+					s_thread_result = pthread_create(&thread, &attr, Worker, nullptr);
+				pthread_attr_destroy(&attr);
+			}
+			if (s_thread_result != 0)
+				ProbeLog("USB log: copy thread failed to start (error %d); the USB copy is made on exit only\n", s_thread_result);
+		}
+		if (s_thread_result != 0)
+		{
+			SessionSummary::WriteFile(SessionSummary::CurrentPath, leftover);
 			return;
-		pthread_attr_t attr;
-		pthread_attr_init(&attr);
-		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-		pthread_attr_setstacksize(&attr, 128 * 1024);
-		pthread_t thread;
-		if (pthread_create(&thread, &attr, CopyThread, nullptr) != 0)
-			s_busy.store(false, std::memory_order_release);
-		pthread_attr_destroy(&attr);
+		}
+		{
+			std::lock_guard lock(s_request_mutex);
+			s_requested_entry = std::move(entry);
+			s_requested_leftover = std::move(leftover);
+			s_requested = true;
+		}
+		s_request_cv.notify_one();
 	}
 
-	// Final copy on exit, after the log file is complete and closed.
-	void CopyFinal()
+	// On exit, after the log file is complete and closed: the finished session joins
+	// the history and the USB file is written one last time.
+	static void Final()
 	{
-		for (int waited = 0; waited < 3000; waited += 20)
+		std::string entry;
 		{
-			bool expected = false;
-			if (s_busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-			{
-				CopyNow();
-				s_busy.store(false, std::memory_order_release);
-				return;
-			}
-			usleep(20 * 1000);
+			std::lock_guard lock(SessionSummary::s_mutex);
+			entry = SessionSummary::Build("cerrada desde el menú");
 		}
+		s_closing.store(true, std::memory_order_release);
+		bool locked = false;
+		for (int waited = 0; waited < 3000 && !(locked = s_copy_mutex.try_lock()); waited += 20)
+			usleep(20 * 1000);
+		SessionSummary::AppendHistory(entry);
+		unlink(SessionSummary::CurrentPath);
+		if (!locked)
+			return; // a USB write is stuck; the history is kept for the next copy
+		std::string why;
+		CopyNow(std::string(), why);
+		s_copy_mutex.unlock();
 	}
 } // namespace UsbLog
 static u32 s_last_ee_cycle = 0;
@@ -453,7 +798,8 @@ void VMHostPoll()
 		if (s_game_session && elapsed - s_last_usb_copy >= 30.0)
 		{
 			s_last_usb_copy = elapsed;
-			UsbLog::CopyAsync();
+			SessionSummary::RefreshGame();
+			UsbLog::Request();
 		}
 			ProbeLog("VM heartbeat: seconds=%.1f EE_PC=%08x IOP_PC=%08x EE_cycles=%u EE_Mcycles_per_second=%.2f "
 				 "Host_polls_per_second=%.0f Host_clock_checks_per_second=%.0f CPU_queue_drain_locks=%llu verbose=%d paused=%d menu=%d vsyncq=%d\n",
@@ -617,6 +963,7 @@ void VMHostPoll()
 			MTGS::GetCurrentVsyncQueueSize());
 		ProbeLog("pause step: PublishGameMenu begin\n");
 		PublishGameMenu();
+		SessionSummary::Mark();
 		ProbeLog("Emulator menu: opened with L3+R3 total_ms=%.2f verbose=%d\n",
 			Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - pause_t0), s_verbose_diag ? 1 : 0);
 		return;
@@ -843,6 +1190,8 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 		ProbeLog("Launcher cheat enabled: %s\n", name.c_str());
 	for (const std::string& name : enabled_patches)
 		ProbeLog("Launcher patch enabled: %s\n", name.c_str());
+	SessionSummary::SetSettings(ee_cycle_rate, ee_cycle_skip, fast_cdvd, fast_boot, audio_enabled, download_mode,
+		minimum_blending, fast_math, enabled_patches, enabled_cheats);
 }
 
 static void* RunVM(void*)
@@ -1175,6 +1524,8 @@ static void* RunVM(void*)
 		}
 		VMManager::SetPaused(false);
 		s_game_session = true;
+		SessionSummary::Begin();
+		SessionSummary::RefreshGame();
 		while (VMManager::GetState() != VMState::Stopping && VMManager::GetState() != VMState::Shutdown)
 		{
 			if (VMManager::GetState() == VMState::Paused)
@@ -1218,6 +1569,7 @@ int main()
 	mkdir("/data/PS4SX2/logs", 0777);
 	const int migrated_logs = MigrateLegacyLogs();
 	const auto archived_logs = PS4SessionLogs::ArchivePrevious();
+	SessionSummary::KeepLeftover();
 	// If archiving fails, append rather than destroying the remaining evidence.
 	const int log_flags = O_WRONLY | O_CREAT | (archived_logs.error ? O_APPEND : O_TRUNC);
 	// (AI-assisted) Redirect descriptors without reopening or altering libc FILE
@@ -1350,7 +1702,7 @@ int main()
 		close(s_log);
 	}
 	if (s_game_session)
-		UsbLog::CopyFinal();
+		UsbLog::Final();
 	if (relaunch_main_menu)
 	{
 		// VM teardown closes Vulkan/VideoOut resources. Reinitializing them in the
