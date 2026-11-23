@@ -48,7 +48,19 @@ __forceinline s32 V_Core::RevbGetIndexer(s32 offset)
 	u32 start = EffectsStartA & 0x3f'ffff;
 	u32 end = (EffectsEndA & 0x3f'ffff) | 0xffff;
 
-	u32 x = ((Cycles >> 1) + offset) % ((end - start) + 1);
+	// Same result as "% size", without a hardware divide (14 per core per sample,
+	// slow on the PS4's CPU): Lemire's exact 32-bit fastmod with a cached reciprocal.
+	static u32 s_divisor[2];
+	static u64 s_reciprocal[2];
+	const u32 size = (end - start) + 1;
+	const u32 core = Index & 1;
+	if (s_divisor[core] != size)
+	{
+		s_divisor[core] = size;
+		s_reciprocal[core] = UINT64_C(0xFFFFFFFFFFFFFFFF) / size + 1;
+	}
+	const u32 value = (Cycles >> 1) + offset;
+	u32 x = static_cast<u32>((static_cast<unsigned __int128>(s_reciprocal[core] * value) * size) >> 64);
 
 	x += start;
 
