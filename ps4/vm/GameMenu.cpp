@@ -374,7 +374,9 @@ namespace PS4GameMenu
 		// Settings view. Each option is stored as the marker files that main.cpp
 		// reads, so it applies to the next game started from the launcher.
 		constexpr const char* SettingPrefix = "ps4sx2://setting/";
-		constexpr size_t SettingCount = 10;
+		constexpr size_t SettingCount = 12;
+		// Settings from here on apply to every game (not saved per game).
+		constexpr size_t FirstGlobalSetting = 10;
 		struct LauncherSetting
 		{
 			const char* name;
@@ -401,9 +403,14 @@ namespace PS4GameMenu
 				{"Saltar", "Mostrar"}, 2},
 			{"Sonido", "Desactivarlo ahorra algo de CPU en juegos muy pesados.",
 				{"Activado", "Desactivado"}, 2},
+			{"Precisión matemática", "Rápida quita comprobaciones de cálculo (más CPU libre). Si ves fallos, vuelve a Normal.",
+				{"Normal", "Rápida"}, 2},
 			{"Prioridad de hilos", "Alta evita que el sistema frene al emulador. Se aplica al volver a abrir PS4SX2.",
 				{"Alta", "Normal"}, 2},
+			{"Diagnóstico de rendimiento", "Anota en el log qué gasta la CPU. Juega 2 min en la zona lenta y pasa los logs.",
+				{"No", "Sí"}, 2},
 		};
+		bool IsGlobalSetting(size_t id) { return id >= FirstGlobalSetting; }
 		// Values of settings 1..6 for each profile (Compatible, Recommended, Maximum).
 		constexpr unsigned ProfileValues[3][6] = {
 			{0, 0, 0, 0, 0, 0},
@@ -459,7 +466,9 @@ namespace PS4GameMenu
 				case 6: return Marker("vm-blend-minimum") ? 1u : 0u;
 				case 7: return Marker("vm-no-fast-boot") ? 1u : 0u;
 				case 8: return Marker("vm-no-audio") ? 1u : 0u;
-				default: return Marker("vm-no-thread-priority") ? 1u : 0u;
+				case 9: return Marker("vm-fast-math") ? 1u : 0u;
+				case 10: return Marker("vm-no-thread-priority") ? 1u : 0u;
+				default: return Marker("vm-ee-hotspots") ? 1u : 0u;
 			}
 		}
 		void SetSetting(size_t id, unsigned value)
@@ -493,7 +502,13 @@ namespace PS4GameMenu
 				case 6: SetMarker("vm-blend-minimum", value == 1); break;
 				case 7: SetMarker("vm-no-fast-boot", value == 1); break;
 				case 8: SetMarker("vm-no-audio", value == 1); break;
-				default: SetMarker("vm-no-thread-priority", value == 1); break;
+				case 9: SetMarker("vm-fast-math", value == 1); break;
+				case 10: SetMarker("vm-no-thread-priority", value == 1); break;
+				default:
+					SetMarker("vm-ee-hotspots", value == 1);
+					SetMarker("vm-profile-perf", value == 1);
+					SetMarker("vm-profile-ee", value == 1);
+					break;
 			}
 		}
 
@@ -503,7 +518,8 @@ namespace PS4GameMenu
 		constexpr const char* CurrentGameFile = "/data/PS4SX2/game-settings/current.txt";
 		constexpr const char* GameMarkers[] = {"vm-ee-cycle-normal", "vm-ee-cycle-underclock", "vm-ee-cycle-minimum",
 			"vm-ee-cycle-skip", "vm-ee-cycle-skip2", "vm-ee-cycle-skip3", "vm-fast-cdvd", "vm-skip-smc",
-			"vm-gpu-readback-unsync", "vm-gpu-readback-off", "vm-blend-minimum", "vm-no-fast-boot", "vm-no-audio"};
+			"vm-gpu-readback-unsync", "vm-gpu-readback-off", "vm-blend-minimum", "vm-no-fast-boot", "vm-no-audio",
+			"vm-fast-math"};
 		struct CurrentGame
 		{
 			std::string serial;
@@ -633,7 +649,7 @@ namespace PS4GameMenu
 					Item item{LauncherSettings[id].name, std::string(SettingPrefix) + std::to_string(id), {}, false};
 					item.detail = LauncherSettings[id].values[std::min(GetSetting(id), id == 0 ? 3u : LauncherSettings[id].count - 1)];
 					item.name = std::string(LauncherSettings[id].name) + ": " + item.detail;
-					if (id == SettingCount - 1)
+					if (IsGlobalSetting(id))
 						item.name += "  ·  todos los juegos";
 					else if (!game.name.empty())
 						item.name += "  ·  " + game.name;
@@ -1244,10 +1260,11 @@ namespace PS4GameMenu
 					const unsigned value = (GetSetting(id) + 1) % LauncherSettings[id].count;
 					SetSetting(id, value);
 					const CurrentGame game = LoadCurrentGame();
-					if (id != SettingCount - 1 && !game.serial.empty())
+					if (!IsGlobalSetting(id) && !game.serial.empty())
 						SaveGameProfile(game.serial);
 					status = std::string(LauncherSettings[id].name) + ": " + LauncherSettings[id].values[value] +
-					         (id == SettingCount - 1 ? ". Se aplica al volver a abrir PS4SX2." :
+					         (id == FirstGlobalSetting ? ". Se aplica al volver a abrir PS4SX2." :
+					          IsGlobalSetting(id) ? ". Se aplica al iniciar el próximo juego (todos los juegos)." :
 					          game.name.empty() ? ". Se aplica al iniciar el próximo juego." :
 					                              ". Guardado para " + game.name + ".");
 					if (id == 0)
