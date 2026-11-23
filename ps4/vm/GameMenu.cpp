@@ -478,7 +478,9 @@ namespace PS4GameMenu
 				case 8: return Marker("vm-no-audio") ? 1u : 0u;
 				case 9: return Marker("vm-fast-math") ? 1u : 0u;
 				case 10: return Marker("vm-no-thread-priority") ? 1u : 0u;
-				default: return Marker("vm-ee-hotspots") ? 1u : 0u;
+				default:
+					return Marker("vm-ee-hotspots") || Marker("vm-profile-perf") ||
+					       Marker("vm-profile-ee") || Marker("vm-profile-gs") ? 1u : 0u;
 			}
 		}
 		void SetSetting(size_t id, unsigned value)
@@ -518,6 +520,7 @@ namespace PS4GameMenu
 					SetMarker("vm-ee-hotspots", value == 1);
 					SetMarker("vm-profile-perf", value == 1);
 					SetMarker("vm-profile-ee", value == 1);
+					SetMarker("vm-profile-gs", value == 1);
 					break;
 			}
 		}
@@ -743,7 +746,7 @@ namespace PS4GameMenu
 				return;
 			for (const char* marker : RiskyMarkers)
 				SetMarker(marker, false);
-			for (const char* marker : {"vm-ee-hotspots", "vm-profile-perf", "vm-profile-ee"})
+			for (const char* marker : {"vm-ee-hotspots", "vm-profile-perf", "vm-profile-ee", "vm-profile-gs"})
 				SetMarker(marker, false);
 			u32 profiles = 0, patches = 0;
 			std::vector<std::string> names;
