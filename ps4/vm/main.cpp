@@ -66,6 +66,8 @@
 #include <pthread.h>
 
 static int s_log = -1;
+// pcsx2/CDVD/CDVDcommon.cpp: called with each 2048-byte sector the game reads.
+extern void (*g_ps4_disc_read_hook)(u8* buffer, u32 lsn);
 
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 extern std::atomic<u32> g_orbis_rec_compiles, g_orbis_rec_discards, g_orbis_rec_page_resets, g_orbis_rec_full_resets;
@@ -1092,6 +1094,92 @@ static void PrepareEmulatorFolders(SettingsInterface& settings)
 // (fork) Re-read the launcher Settings markers after the game menu closes, so a
 // change made in Settings applies to the game started now. Fastmem stays as set
 // before CPUThreadInitialize (its VTLB mappings already exist).
+// (fork) Bee Movie Game (PAL, SLES-55016): no car engine or horn sounds. Every sound
+// object in the game's data keeps its base volume in dB, and the game itself uses
+// -96 dB for sounds it silences. With the patch "Sonido: sin motores de coches" on,
+// the disc reader rewrites the base volume of the engine loops (traffic and player
+// cars, scooter, race cars, drifts) and of the horns to -96 dB as the sectors are
+// read. Each value is checked against the original and against the 0x3ed record
+// tag 0x14 bytes before it, so another disc or version is never touched.
+namespace BeeCarMute
+{
+	constexpr const char* Serial = "SLES-55016";
+	constexpr const char* PatchName = "Sonido: sin motores de coches";
+	struct Fix
+	{
+		u32 offset; // byte offset of the volume in the disc image
+		u32 original;
+	};
+	constexpr Fix Fixes[] = {
+		{49261920, 0xc1900000}, // CarIdle
+		{49262276, 0xc0800000}, // BeeHiveCar_Drift_Lp
+		{49262744, 0xc1180000}, // Beehivescooter01_Lp
+		{49264872, 0xc2480000}, // BeeHiveCar02_Lp
+		{49266900, 0xc1500000}, // HiveCar01_Lp
+		{49267256, 0xc1100000}, // HiveCar02_Lp
+		{49267612, 0xc1500000}, // HiveCar03_Lp
+		{49267968, 0xc1c80000}, // BonusCar03_Lp
+		{49268324, 0xc1500000}, // BonusCar04_Lp
+		{49268680, 0xc1b80000}, // BonusCar05_Lp
+		{49269036, 0xc1600000}, // HiveCar04_Lp
+		{49269392, 0xc1a80000}, // HiveCar05_Lp
+		{49269748, 0xc0c00000}, // HiveCab_Lp
+		{49270104, 0xc1a00000}, // honexCar_Lp
+		{49270460, 0xc1ac0000}, // BonusCar02_Lp
+		{49270816, 0xc1900000}, // BonusCar01_Lp
+		{49271512, 0x00000000}, // Npc_honexCar_Lp
+		{49271868, 0xc0c00000}, // Npc_HiveCar05_Lp
+		{49272224, 0xc0800000}, // Npc_HiveCar04_Lp
+		{49272580, 0xc0900000}, // Npc_HiveCar03_Lp
+		{49272936, 0xbfc00000}, // Npc_HiveCar02_Lp
+		{49273292, 0xc0400000}, // Npc_HiveCar01_Lp
+		{49273648, 0xc0a00000}, // Npc_HiveCab_Lp
+		{49274004, 0xc1200000}, // RaceCar01
+		{49274360, 0xc1200000}, // RaceCar02
+		{49274716, 0xc1980000}, // HiveSuperCab_Lp
+		{49275072, 0x00000000}, // Horn_HiveCar01
+		{49275412, 0x00000000}, // Horn_HiveCar02
+		{49275752, 0x00000000}, // Horn_HiveCar03
+		{49276092, 0x00000000}, // Horn_HiveCar04
+		{49276432, 0x00000000}, // Horn_HiveCar05
+		{49276772, 0x00000000}, // Horn_BonusCar01
+		{49277112, 0x00000000}, // Horn_BonusCar02
+		{49277452, 0x00000000}, // Horn_BonusCar03
+		{49277792, 0x00000000}, // Horn_BonusCar04
+		{49278132, 0x00000000}, // Horn_BonusCar05
+		{69596652, 0xc1200000}, // BeeUnderCar_Lp
+		{69599032, 0x00000000}, // RainCarEngine_3D_Lp
+		{208582344, 0x00000000}, // Race_Npc_Car_Drift_3D_Lp
+		{336736704, 0xc0200000}, // Random_CityHornAmb
+		{343362268, 0xc0200000}, // Random_CityHornAmb
+	};
+	constexpr u32 Silent = 0xc2c00000; // -96.0f
+	static std::atomic<u32> s_applied{0};
+
+	static void Hook(u8* buffer, u32 lsn)
+	{
+		const u64 begin = static_cast<u64>(lsn) * 2048;
+		const u64 end = begin + 2048;
+		if (end <= Fixes[0].offset || begin > std::end(Fixes)[-1].offset)
+			return;
+		const Fix* fix = std::lower_bound(std::begin(Fixes), std::end(Fixes), begin,
+			[](const Fix& f, u64 value) { return f.offset < value; });
+		for (; fix != std::end(Fixes) && fix->offset < end; ++fix)
+		{
+			const u32 pos = static_cast<u32>(fix->offset - begin);
+			u32 value, tag = 0x3ed;
+			std::memcpy(&value, buffer + pos, sizeof(value));
+			if (pos >= 0x14)
+				std::memcpy(&tag, buffer + pos - 0x14, sizeof(tag));
+			if (value != fix->original || tag != 0x3ed)
+				continue;
+			std::memcpy(buffer + pos, &Silent, sizeof(Silent));
+			if (s_applied.fetch_add(1, std::memory_order_relaxed) < 2)
+				ProbeLog("Bee Movie: car sound muted at disc offset %u\n", fix->offset);
+		}
+	}
+} // namespace BeeCarMute
+
 static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 {
 	int ee_cycle_rate = -1;
@@ -1143,6 +1231,7 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 	// Cheats and patches enabled for this game in the launcher's Trucos view
 	// (game-settings/SERIAL.cheats: "C|name" = cheat, "P|name" = patch).
 	std::vector<std::string> enabled_cheats, enabled_patches;
+	std::string game_serial;
 	{
 		const auto read_line = [](FILE* file, std::string& out) {
 			char line[512];
@@ -1167,7 +1256,11 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 		}
 		if (file)
 			std::fclose(file);
+		game_serial = serial;
 	}
+	const bool bee_car_mute = game_serial == BeeCarMute::Serial &&
+		std::find(enabled_patches.begin(), enabled_patches.end(), BeeCarMute::PatchName) != enabled_patches.end();
+	g_ps4_disc_read_hook = bee_car_mute ? BeeCarMute::Hook : nullptr;
 	settings->SetBoolValue("EmuCore", "EnableCheats", !enabled_cheats.empty());
 	if (enabled_cheats.empty())
 		settings->DeleteValue("Cheats", "Enable");
@@ -1190,6 +1283,8 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 		ProbeLog("Launcher cheat enabled: %s\n", name.c_str());
 	for (const std::string& name : enabled_patches)
 		ProbeLog("Launcher patch enabled: %s\n", name.c_str());
+	if (bee_car_mute)
+		ProbeLog("Bee Movie: car engine and horn sounds muted from disc data (%zu sounds)\n", std::size(BeeCarMute::Fixes));
 	SessionSummary::SetSettings(ee_cycle_rate, ee_cycle_skip, fast_cdvd, fast_boot, audio_enabled, download_mode,
 		minimum_blending, fast_math, enabled_patches, enabled_cheats);
 }
