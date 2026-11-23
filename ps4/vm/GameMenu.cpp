@@ -411,11 +411,14 @@ namespace PS4GameMenu
 				{"No", "Sí"}, 2},
 		};
 		bool IsGlobalSetting(size_t id) { return id >= FirstGlobalSetting; }
-		// Values of settings 1..6 for each profile (Compatible, Recommended, Maximum).
-		constexpr unsigned ProfileValues[3][6] = {
-			{0, 0, 0, 0, 0, 0},
-			{1, 0, 0, 0, 0, 0},
-			{2, 1, 1, 0, 1, 1},
+		// Settings changed by the performance profile, and their values for each
+		// profile (Compatible, Recommended, Maximum).
+		constexpr size_t ProfileSettingCount = 7;
+		constexpr size_t ProfileSettings[ProfileSettingCount] = {1, 2, 3, 4, 5, 6, 9};
+		constexpr unsigned ProfileValues[3][ProfileSettingCount] = {
+			{0, 0, 0, 0, 0, 0, 0},
+			{1, 0, 0, 0, 0, 0, 0},
+			{2, 1, 1, 0, 1, 1, 1},
 		};
 		bool Marker(const char* name)
 		{
@@ -448,8 +451,8 @@ namespace PS4GameMenu
 					for (unsigned profile = 0; profile < 3; ++profile)
 					{
 						bool match = true;
-						for (size_t i = 0; i < 6 && match; ++i)
-							match = GetSetting(i + 1) == ProfileValues[profile][i];
+						for (size_t i = 0; i < ProfileSettingCount && match; ++i)
+							match = GetSetting(ProfileSettings[i]) == ProfileValues[profile][i];
 						if (match)
 							return profile;
 					}
@@ -476,8 +479,8 @@ namespace PS4GameMenu
 			switch (id)
 			{
 				case 0:
-					for (size_t i = 0; i < 6; ++i)
-						SetSetting(i + 1, ProfileValues[std::min(value, 2u)][i]);
+					for (size_t i = 0; i < ProfileSettingCount; ++i)
+						SetSetting(ProfileSettings[i], ProfileValues[std::min(value, 2u)][i]);
 					break;
 				case 1:
 					SetMarker("vm-ee-cycle-mild", false);
