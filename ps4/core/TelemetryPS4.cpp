@@ -50,6 +50,9 @@ namespace
 	pthread_t s_thread{};
 	bool s_thread_running = false;
 	bool s_stopping = false;
+	Common::Timer::Value s_stop_tick{}; // when Stop() was called
+	// At exit the queue is flushed only while the PC answers, and for at most this long.
+	constexpr double kStopFlushSeconds = 1.5;
 	std::size_t s_head = 0, s_count = 0;
 	unsigned long long s_enqueued = 0, s_dropped = 0, s_sent = 0, s_send_errors = 0;
 	unsigned long long s_connect_attempts = 0, s_connect_ok = 0;
@@ -293,6 +296,30 @@ namespace
 		return out;
 	}
 
+	// Shutdown helpers: an exit must never wait for a PC that is not listening.
+	bool Stopping()
+	{
+		pthread_mutex_lock(&s_mutex);
+		const bool stopping = s_stopping;
+		pthread_mutex_unlock(&s_mutex);
+		return stopping;
+	}
+	void DropQueued()
+	{
+		pthread_mutex_lock(&s_mutex);
+		s_dropped += s_count;
+		s_count = 0;
+		pthread_mutex_unlock(&s_mutex);
+	}
+	void SleepUnlessStopping(int ms)
+	{
+		for (int slept = 0; slept < ms && !Stopping(); slept += 50)
+		{
+			struct timespec ts{0, 50 * 1000000L};
+			nanosleep(&ts, nullptr);
+		}
+	}
+
 	void* ThreadMain(void*)
 	{
 		pthread_setname_np(pthread_self(), "PS4 telemetry");
@@ -309,6 +336,13 @@ namespace
 				pthread_mutex_unlock(&s_mutex);
 				break;
 			}
+			if (s_stopping && Common::Timer::ConvertValueToSeconds(Common::Timer::GetCurrentValue() - s_stop_tick) > kStopFlushSeconds)
+			{
+				s_dropped += s_count;
+				s_count = 0;
+				pthread_mutex_unlock(&s_mutex);
+				break;
+			}
 			Entry entry = s_queue[s_head];
 			s_head = (s_head + 1) % kCapacity;
 			--s_count;
@@ -317,6 +351,13 @@ namespace
 			// Ensure connected
 			if (!s_connected)
 			{
+				// Exiting with no connection: drop what is left instead of retrying.
+				if (Stopping())
+				{
+					++s_dropped;
+					DropQueued();
+					break;
+				}
 				if (!TryConnect())
 				{
 					// Drop or requeue? We send with best-effort: requeue with limit
@@ -330,10 +371,7 @@ namespace
 						// still count as dropped after failed reconnect
 					}
 					// Backoff
-					struct timespec ts{};
-					ts.tv_sec = reconnect_ms / 1000;
-					ts.tv_nsec = (reconnect_ms % 1000) * 1000000L;
-					nanosleep(&ts, nullptr);
+					SleepUnlessStopping(reconnect_ms);
 					reconnect_ms = std::min(reconnect_ms * 2, kReconnectMaxMs);
 
 					// Put entry back if it's important, else drop
@@ -381,9 +419,13 @@ namespace
 					++s_dropped;
 				}
 				pthread_mutex_unlock(&s_mutex);
+				if (Stopping())
+				{
+					DropQueued();
+					break;
+				}
 				// brief pause before reconnect
-				struct timespec ts{0, 200 * 1000000L};
-				nanosleep(&ts, nullptr);
+				SleepUnlessStopping(200);
 				continue;
 			}
 			++s_sent;
@@ -479,6 +521,7 @@ namespace PS4Telemetry
 			return;
 		pthread_mutex_lock(&s_mutex);
 		s_stopping = true;
+		s_stop_tick = Common::Timer::GetCurrentValue();
 		pthread_cond_signal(&s_ready);
 		pthread_mutex_unlock(&s_mutex);
 		pthread_join(s_thread, nullptr);
