@@ -1454,12 +1454,15 @@ static void* RunVM(void*)
 	ProbeLog("PS4 audio configuration: %s (stereo PCM16 48 kHz, main port, explicit 0 dB; disable with /data/PS4SX2/vm-no-audio)\n",
 		audio_enabled ? "native AudioOut with TimeStretch" : "Null by marker");
 	PrepareEmulatorFolders(*settings);
-	const bool performance_profile_opt_in = access("/data/PS4SX2/vm-profile-perf", F_OK) == 0 &&
-	                                        access("/data/PS4SX2/vm-no-perf-profile", F_OK) != 0;
+	const bool performance_profile = access("/data/PS4SX2/vm-profile-perf", F_OK) == 0 &&
+	                                 access("/data/PS4SX2/vm-no-perf-profile", F_OK) != 0;
 	const bool gs_profile_opt_in = access("/data/PS4SX2/vm-profile-gs", F_OK) == 0 ||
-	                               performance_profile_opt_in;
-	PS4GSProfile::enabled = gs_profile_opt_in && access("/data/PS4SX2/vm-no-gs-profile", F_OK) != 0;
-	ProbeLog("GS profiling: %s (hot calls sampled 1/64; inclusive wall time)\n",
+	                               performance_profile || s_verbose_diag;
+	const bool gs_profile_disabled = access("/data/PS4SX2/vm-no-gs-profile", F_OK) == 0;
+	// Set this before CPUThreadInitialize starts the GS thread. Once GS is open,
+	// the GS thread is the sole reader of this plain bool.
+	PS4GSProfile::enabled = gs_profile_opt_in && !gs_profile_disabled;
+	ProbeLog("GS profiling: %s (1/64 hot-call samples; explicit disable overrides verbose)\n",
 		PS4GSProfile::enabled ? "enabled by opt-in marker" : "disabled for performance");
 	ProbeLog("VM configuration: observation=unlimited renderer=vulkan mtvu=%s fastmem-build=%s shader_cache=%s directory=%s\n",
 #if defined(PCSX2_PS4_VM_BOOT_MTVU)
@@ -1606,7 +1609,6 @@ static void* RunVM(void*)
 		Pad::SetControllerState(0, PadDualshock2::Inputs::PAD_ANALOG, 1.0f);
 		Pad::SetControllerState(0, PadDualshock2::Inputs::PAD_ANALOG, 0.0f);
 		ProbeLog("Controller: DualShock 2 analog mode enabled; both sticks and analog triggers forwarded.\n");
-		s_verbose_diag = access("/data/PS4SX2/vm-verbose-log", F_OK) == 0;
 		ProbeLog("Verbose diagnostics: %s (single marker /data/PS4SX2/vm-verbose-log forces 1s heartbeat, TimedWaitGS, and GS/EE hotspot sampling)\n",
 			s_verbose_diag ? "ENABLED" : "disabled");
 		s_run_timer.Reset();
@@ -1624,21 +1626,12 @@ static void* RunVM(void*)
 		PS4EEEventProfile::s_sampling = {};
 		// (AI-assisted) Keep deep profiling opt-in: PS1 can reach over a million
 		// event polls per second. Normal FPS/CPU metrics and heartbeat stay active.
-		const bool performance_profile = access("/data/PS4SX2/vm-profile-perf", F_OK) == 0 &&
-		                                 access("/data/PS4SX2/vm-no-perf-profile", F_OK) != 0;
 		PS4WorkerProfile::enabled.store(performance_profile, std::memory_order_relaxed);
 		PS4EEEventProfile::s_sampling.enabled = ((performance_profile || access("/data/PS4SX2/vm-profile-ee", F_OK) == 0) && access("/data/PS4SX2/vm-no-ee-profile", F_OK) != 0) || s_verbose_diag;
 		PS4EEEventProfile::s_sampling.gaps_only = false;
 		PS4EEEventProfile::s_sampling.gap_observer = PS4EEEventProfile::RecordGap;
 		ProbeLog("Performance diagnosis: workers=%d EE_phases=%d sample_ratio=1/1024; opt-in with /data/PS4SX2/vm-profile-perf\n",
 			performance_profile ? 1 : 0, PS4EEEventProfile::s_sampling.enabled ? 1 : 0);
-		// The performance-diagnostics toggle predates the separate GS marker.
-		// Keep profiles saved by older builds useful, unless GS profiling is explicitly disabled.
-		const bool gs_profile_opt_in = access("/data/PS4SX2/vm-profile-gs", F_OK) == 0 || performance_profile;
-		PS4GSProfile::enabled = s_verbose_diag ||
-		                        (gs_profile_opt_in && access("/data/PS4SX2/vm-no-gs-profile", F_OK) != 0);
-		ProbeLog("GS profiling: %s (hot calls sampled 1/64; inclusive wall time)\n",
-			PS4GSProfile::enabled ? "enabled" : "disabled");
 		s_host_poll_gate.Reset();
 		ProbeLog("Host clock gate runtime: max_calls=%u cycle_interval=%u input_interval_ms=10\n",
 			s_host_poll_gate.GetMaxCalls(), s_host_poll_gate.GetCycleInterval());
