@@ -36,4 +36,22 @@ void PS4GSProfile::LogInterval(double seconds)
 		c.calls = c.samples = 0;
 		c.elapsed = c.maximum = 0;
 	}
+	constexpr const char* gif_names[] = {"packed_unknown", "packed_ad_only", "packed_stq_rgbaxyzf2",
+		"packed_stq_rgbaxyz2", "reglist", "image", "image2", "other"};
+	static_assert(std::size(gif_names) == GIFCount);
+	for (unsigned i = 0; i < GIFCount; i++)
+	{
+		auto& c = gif_counters[i];
+		if (c.calls)
+		{
+			ProbeLog("GS GIF path timing: interval=%.3f kind=%s calls=%llu samples=%llu sampled_wall_ms=%.3f "
+					 "sample_max_ms=%.3f sample_ratio=1/256 inclusive=yes\n",
+				seconds, gif_names[i],
+				static_cast<unsigned long long>(c.calls), static_cast<unsigned long long>(c.samples),
+				Common::Timer::ConvertValueToMilliseconds(c.elapsed),
+				Common::Timer::ConvertValueToMilliseconds(c.maximum));
+		}
+		c.calls = c.samples = 0;
+		c.elapsed = c.maximum = 0;
+	}
 }

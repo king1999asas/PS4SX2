@@ -12,6 +12,10 @@
 #include "common/Path.h"
 #include "common/StringUtil.h"
 
+#if defined(PCSX2_PS4_VM_BOOT)
+#include "ps4/core/GSProfilePS4.h"
+#endif
+
 #include <algorithm>
 #include <cfloat>
 #include <fstream>
@@ -3379,6 +3383,26 @@ void GSState::Transfer(const u8* mem, u32 size)
 		else
 		{
 			u32 total;
+#if defined(PCSX2_PS4_VM_BOOT)
+			PS4GSProfile::GIFKind gif_kind = PS4GSProfile::GIFOther;
+			switch (path.tag.FLG)
+			{
+				case GIF_FLG_PACKED:
+					switch (path.type)
+					{
+						case GIFPath::TYPE_ADONLY: gif_kind = PS4GSProfile::GIFPackedADOnly; break;
+						case GIFPath::TYPE_STQRGBAXYZF2: gif_kind = PS4GSProfile::GIFPackedSTQRGBAXYZF2; break;
+						case GIFPath::TYPE_STQRGBAXYZ2: gif_kind = PS4GSProfile::GIFPackedSTQRGBAXYZ2; break;
+						default: gif_kind = PS4GSProfile::GIFPackedUnknown; break;
+					}
+					break;
+				case GIF_FLG_REGLIST: gif_kind = PS4GSProfile::GIFReglist; break;
+				case GIF_FLG_IMAGE: gif_kind = PS4GSProfile::GIFImage; break;
+				case GIF_FLG_IMAGE2: gif_kind = PS4GSProfile::GIFImage2; break;
+				default: break;
+			}
+			PS4GSProfile::GIFScope gif_scope(gif_kind);
+#endif
 
 			switch (path.tag.FLG)
 			{

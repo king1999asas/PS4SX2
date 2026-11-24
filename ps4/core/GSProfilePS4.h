@@ -27,13 +27,32 @@ namespace PS4GSProfile
 		SWSprite,
 		Count
 	};
+	enum GIFKind
+	{
+		GIFPackedUnknown,
+		GIFPackedADOnly,
+		GIFPackedSTQRGBAXYZF2,
+		GIFPackedSTQRGBAXYZ2,
+		GIFReglist,
+		GIFImage,
+		GIFImage2,
+		GIFOther,
+		GIFCount
+	};
 	struct Counter
 	{
 		u64 calls = 0, samples = 0;
 		Common::Timer::Value elapsed = 0, maximum = 0;
 		u32 random = 0x47535035;
 	};
+	struct GIFCounter
+	{
+		u64 calls = 0, samples = 0;
+		Common::Timer::Value elapsed = 0, maximum = 0;
+		u32 random = 0x47494635;
+	};
 	inline Counter counters[Count];
+	inline GIFCounter gif_counters[GIFCount];
 	inline bool enabled = false; // Set before opening GS; thereafter GS is sole owner.
 	class Scope
 	{
@@ -68,6 +87,37 @@ namespace PS4GSProfile
 		}
 		Scope(const Scope&) = delete;
 		Scope& operator=(const Scope&) = delete;
+	};
+	class GIFScope
+	{
+		GIFCounter* m_counter = nullptr;
+		Common::Timer::Value m_start = 0;
+
+	public:
+		explicit GIFScope(GIFKind kind)
+		{
+			if (!enabled)
+				return;
+			auto& c = gif_counters[kind];
+			++c.calls;
+			c.random = c.random * 1664525U + 1013904223U;
+			if ((c.random >> 24) != 0) // Time roughly 1/256 payload-handler calls.
+				return;
+			m_counter = &c;
+			m_start = Common::Timer::GetCurrentValue();
+		}
+		~GIFScope()
+		{
+			if (!m_counter)
+				return;
+			const auto duration = Common::Timer::GetCurrentValue() - m_start;
+			++m_counter->samples;
+			m_counter->elapsed += duration;
+			if (duration > m_counter->maximum)
+				m_counter->maximum = duration;
+		}
+		GIFScope(const GIFScope&) = delete;
+		GIFScope& operator=(const GIFScope&) = delete;
 	};
 	void LogInterval(double seconds);
 } // namespace PS4GSProfile
