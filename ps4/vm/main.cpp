@@ -2077,6 +2077,9 @@ static void* RunVM(void*)
 		s_run_timer.Reset();
 		const bool hotspot_marker = access("/data/PS4SX2/vm-ee-hotspots", F_OK) == 0 && access("/data/PS4SX2/vm-no-ee-hotspots", F_OK) != 0;
 		PS4EEHotspots::Reset(hotspot_marker || s_verbose_diag);
+		PS4EEHotspots::ResetVU1ProgramProfile(hotspot_marker || s_verbose_diag);
+		ProbeLog("VU1 program sampling: %s (all entries; per-second run and guest-cycle counts by PC)\n",
+			(hotspot_marker || s_verbose_diag) ? "enabled" : "disabled for performance");
 		ProbeLog("EE hotspots: %s; event and IPU-call frequencies, not CPU-time shares (disable with /data/PS4SX2/vm-no-ee-hotspots)\n",
 			PS4EEHotspots::enabled ? "enabled" : "disabled");
 #if defined(PCSX2_PS4_VM_EE_BLOCK_PROFILE)

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0+
-// (AI-assisted) All collection, consumption and reset occur on the EE owner.
+// (AI-assisted) EE-owned histograms plus MTVU VU1 samples, handed off through double buffers.
 #include "EEHotspotsPS4.h"
 #include "pcsx2/vtlb.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 
 extern void ProbeLog(const char*, ...);
@@ -16,6 +17,22 @@ namespace PS4EEHotspots
 	u32 block_sample_countdown = 0xffffffffU;
 	namespace
 	{
+		struct VU1ProgramEntry
+		{
+			u64 runs = 0;
+			u64 cycles = 0;
+			u64 instruction = 0;
+		};
+		constexpr u32 VU1ProgramCount = 0x4000 / 8;
+		struct VU1ProgramBuffer
+		{
+			std::array<VU1ProgramEntry, VU1ProgramCount> entries{};
+		};
+		std::array<VU1ProgramBuffer, 2> s_vu1_program_buffers{};
+		std::atomic<u32> s_vu1_program_active{0};
+		std::array<std::atomic<u32>, 2> s_vu1_program_writers{};
+		std::atomic<bool> s_vu1_program_profile_enabled{false};
+
 		struct Entry
 		{
 			u32 pc = 0;
@@ -216,6 +233,56 @@ namespace PS4EEHotspots
 			}
 			s_weighted_blocks = {};
 		}
+
+		void LogVU1Programs(double seconds)
+		{
+			struct RankedProgram
+			{
+				u32 pc = 0;
+				u64 runs = 0;
+				u64 cycles = 0;
+				u64 instruction = 0;
+			};
+			std::array<RankedProgram, 12> top{};
+			u64 total_runs = 0;
+			u64 total_cycles = 0;
+			const u32 active = s_vu1_program_active.load(std::memory_order_relaxed) & 1;
+			const u32 read_buffer = s_vu1_program_active.exchange(active ^ 1, std::memory_order_acq_rel);
+			while (s_vu1_program_writers[read_buffer].load(std::memory_order_acquire) != 0)
+			{
+			}
+			auto& entries = s_vu1_program_buffers[read_buffer].entries;
+			for (u32 i = 0; i < VU1ProgramCount; ++i)
+			{
+				VU1ProgramEntry& entry = entries[i];
+				const u64 runs = entry.runs;
+				const u64 cycles = entry.cycles;
+				if (!runs)
+					continue;
+				total_runs += runs;
+				total_cycles += cycles;
+				RankedProgram candidate{i * 8, runs, cycles, entry.instruction};
+				if (candidate.cycles <= top.back().cycles)
+					continue;
+				top.back() = candidate;
+				std::sort(top.begin(), top.end(), [](const RankedProgram& a, const RankedProgram& b) {
+					return a.cycles > b.cycles;
+				});
+			}
+			entries = {};
+			ProbeLog("VU1 program profile: seconds=%.2f runs=%llu cycles=%llu metric=exact_guest_cycles_by_entry_pc dropped=0\n",
+				seconds, static_cast<unsigned long long>(total_runs), static_cast<unsigned long long>(total_cycles));
+			for (const RankedProgram& program : top)
+			{
+				if (!program.runs)
+					break;
+				ProbeLog("VU1 program work item: pc=%04x runs=%llu cycles=%llu cycle_share_pct=%.2f avg_cycles=%llu instruction=%016llx\n",
+					program.pc, static_cast<unsigned long long>(program.runs), static_cast<unsigned long long>(program.cycles),
+					100.0 * static_cast<double>(program.cycles) / std::max<u64>(1, total_cycles),
+					static_cast<unsigned long long>(program.cycles / program.runs),
+					static_cast<unsigned long long>(program.instruction));
+			}
+		}
 	} // namespace
 
 	void Reset(bool enable)
@@ -275,6 +342,41 @@ namespace PS4EEHotspots
 		block_sample_countdown = block_sampling_enabled ? 2048U + (s_block_random & 2047U) : 0xffffffffU;
 	}
 
+	void ResetVU1ProgramProfile(bool enable)
+	{
+		s_vu1_program_profile_enabled.store(false, std::memory_order_relaxed);
+		s_vu1_program_active.store(0, std::memory_order_relaxed);
+		for (std::atomic<u32>& writers : s_vu1_program_writers)
+			writers.store(0, std::memory_order_relaxed);
+		for (VU1ProgramBuffer& buffer : s_vu1_program_buffers)
+		{
+			buffer.entries = {};
+		}
+		s_vu1_program_profile_enabled.store(enable, std::memory_order_relaxed);
+	}
+
+	void RecordVU1Program(u32 pc, u64 cycles, u64 instruction)
+	{
+		if (!s_vu1_program_profile_enabled.load(std::memory_order_relaxed) || pc >= 0x4000)
+			return;
+		for (;;)
+		{
+			const u32 buffer_index = s_vu1_program_active.load(std::memory_order_acquire) & 1;
+			s_vu1_program_writers[buffer_index].fetch_add(1, std::memory_order_acquire);
+			if (buffer_index != (s_vu1_program_active.load(std::memory_order_acquire) & 1))
+			{
+				s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
+				continue;
+			}
+			VU1ProgramEntry& entry = s_vu1_program_buffers[buffer_index].entries[(pc & ~7U) >> 3];
+			++entry.runs;
+			entry.cycles += cycles;
+			entry.instruction = instruction;
+			s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
+			return;
+		}
+	}
+
 	void SampleEvent(u32 pc, u32 pending)
 	{
 		if (!enabled || !Select(s_event_random, 255))
@@ -303,6 +405,8 @@ namespace PS4EEHotspots
 	{
 		if (seconds <= 0)
 			return;
+		if (s_vu1_program_profile_enabled.load(std::memory_order_relaxed))
+			LogVU1Programs(seconds);
 		if (block_sampling_enabled)
 		{
 			LogHistogram("JIT_block_entry_random_1of2048to4095", s_blocks);

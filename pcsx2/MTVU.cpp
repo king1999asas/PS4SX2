@@ -10,7 +10,11 @@
 #include "Vif_Dynarec.h"
 #include "OrbisEEProf.h"
 #include "ps4/core/WorkerProfilePS4.h"
+#if defined(PCSX2_PS4_VM_BOOT)
+#include "ps4/core/EEHotspotsPS4.h"
+#endif
 
+#include <cstring>
 #include <thread>
 #if defined(PCSX2_PS4_VM_BOOT)
 #include "ps4/core/ThreadCPUMetricsPS4.h"
@@ -326,6 +330,10 @@ void VU_Thread::ExecuteRingBuffer()
 					const u32 orbis_start_tpc = (VU1.VI[REG_TPC].UL & 0x7ff) * 8;
 					const u16 orbis_start_vi3 = VU1.VI[3].US[0], orbis_start_vi4 = VU1.VI[4].US[0];
 					const u32 orbis_start_q0 = reinterpret_cast<const u32*>(VU1.Mem)[0];
+#if defined(PCSX2_PS4_VM_BOOT)
+					u64 orbis_start_instruction = 0;
+					std::memcpy(&orbis_start_instruction, VU1.Micro + orbis_start_tpc, sizeof(orbis_start_instruction));
+#endif
 					CpuVU1->SetStartPC(VU1.VI[REG_TPC].UL << 3);
 					{
 						PS4_WORKER_SCOPE(VUExecute);
@@ -338,6 +346,9 @@ void VU_Thread::ExecuteRingBuffer()
 					// vk-285-74: only this thread writes them, so no locked adds.
 					g_orbis_vu1_cycles.store(g_orbis_vu1_cycles.load(std::memory_order_relaxed) + VU1.cycle, std::memory_order_relaxed);
 					g_orbis_vu1_runs.store(g_orbis_vu1_runs.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+#if defined(PCSX2_PS4_VM_BOOT)
+					PS4EEHotspots::RecordVU1Program(orbis_start_tpc, VU1.cycle, orbis_start_instruction);
+#endif
 					{
 						// vk-285-77: the run's length (the GS thread reads and resets these once a second).
 						const u64 c = VU1.cycle;
