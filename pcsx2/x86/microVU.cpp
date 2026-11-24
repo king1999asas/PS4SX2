@@ -513,9 +513,9 @@ size_t OrbisMVUUsed(int vu, size_t* size)
 }
 
 // vk-285-74: the VU1 recompiler's state, for studying offline which x86 code the hot VU1 programs get
-// (tools/vu1dump.py, with a vuprof profile of the same launch). Raised by the vudump flag (GSRenderer.cpp)
-// and run on the MTVU thread between two programs (MTVU.cpp), where nothing compiles or frees. The buffer
-// goes to /data/PCSX2/logs/vu1dump-<n>.bin from a thread of its own. Little-endian layout:
+// (with a VU1 program profile from the same launch). Requested from the paused game menu and run on the
+// MTVU thread between two programs (MTVU.cpp), where nothing compiles or frees. The buffer goes to
+// /data/PS4SX2/logs/vu1dump-<n>.bin from a writer thread, then is included with the session logs. Little-endian layout:
 //   "VU1DUMP1", u32 version (1), u32 0, u64 VU1 cycles run so far, u64 program runs so far
 //   VU1 micro memory (16 KiB), VU1 data memory (16 KiB)
 //   u64 code base (the rec cache, dispatchers first), u64 bytes in use, the bytes
@@ -523,6 +523,8 @@ size_t OrbisMVUUsed(int vu, size_t* size)
 //   (s32 start, s32 end), its micro memory copy (16 KiB), u32 block count, per block u32 PC (bytes) and
 //   u64 x86 entry.
 // Needs proper testing.
+static std::vector<std::thread> s_orbis_vu1_dump_writers;
+
 void OrbisVU1Dump()
 {
 	static int s_count = 0;
@@ -605,17 +607,30 @@ void OrbisVU1Dump()
 	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
 	char path[96];
-	std::snprintf(path, sizeof(path), "/data/PCSX2/logs/vu1dump-%d.bin", n);
+	std::snprintf(path, sizeof(path), "/data/PS4SX2/logs/vu1dump-%d.bin", n);
+	const std::string temporary = std::string(path) + ".tmp";
 	printf("[vudump] %d: %u programs, %u blocks, code %p + %#llx, %zu bytes, built in %.1f ms on the MTVU thread -> %s\n", n,
 		nprog, nblocks, static_cast<const void*>(base), static_cast<unsigned long long>(used), out.size(), ms, path);
 	fflush(stdout);
-	std::thread([buf = std::move(out), file = std::string(path)]() {
-		FILE* f = std::fopen(file.c_str(), "wb");
+	s_orbis_vu1_dump_writers.emplace_back([buf = std::move(out), file = std::string(path), temporary]() {
+		FILE* f = std::fopen(temporary.c_str(), "wb");
 		const size_t written = f ? std::fwrite(buf.data(), 1, buf.size(), f) : 0;
-		if (f)
-			std::fclose(f);
-		printf("[vudump] %s: %s (%zu of %zu bytes)\n", file.c_str(), written == buf.size() ? "written" : "write failed", written,
+		const bool closed = f && std::fclose(f) == 0;
+		const bool published = written == buf.size() && closed && std::rename(temporary.c_str(), file.c_str()) == 0;
+		if (!published)
+			std::remove(temporary.c_str());
+		printf("[vudump] %s: %s (%zu of %zu bytes)\n", file.c_str(), published ? "written" : "write failed", written,
 			buf.size());
 		fflush(stdout);
-	}).detach();
+	});
+}
+
+void OrbisVU1DumpWait()
+{
+	for (std::thread& writer : s_orbis_vu1_dump_writers)
+	{
+		if (writer.joinable())
+			writer.join();
+	}
+	s_orbis_vu1_dump_writers.clear();
 }

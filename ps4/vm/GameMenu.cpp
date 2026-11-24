@@ -2049,7 +2049,7 @@ namespace PS4GameMenu
 				"Continue emulation from the current frame",
 				"Increase internal rendering quality for this session",
 				"Choose the display shape used by the GS renderer",
-				"Show or hide FPS, speed and timing indicators",
+				"Show or hide FPS, speed and timing indicators; L1 captures VU1 code",
 				"Close the VM and reopen the PS4SX2 game library",
 				"Close the VM and exit PS4SX2"};
 			const auto draw_option_icon = [&](unsigned row, float cx, float cy, bool selected) {
@@ -2108,7 +2108,8 @@ namespace PS4GameMenu
 			std::snprintf(hint, sizeof(hint), "Left/Right: change value   |   Resolution range: 1x-%ux", max_upscale);
 		draw->AddText(font, 17.0f * scale, point(138, 756), muted, hint);
 		draw->AddText(font, 17.0f * scale, point(138, 786), muted, "1x recomendado en PS4 normal: 2x o más puede bajar mucho los FPS (3x-4x solo para PS4 Pro).");
-		draw->AddText(font, 17.0f * scale, point(138, 816), muted, "Up/Down: select   Left/Right: change   X: confirm   Circle: resume");
+		draw->AddText(font, 17.0f * scale, point(138, 816), muted,
+			"Up/Down: select   Left/Right: change   X: confirm   L1 on overlay: capture VU1 code   Circle: resume");
 			image("controle_x", 1480, 904, 30, 30);
 			draw->AddText(font, 20.0f * scale, point(1524, 909), white, "Confirm");
 			image("controle_bola", 1690, 904, 30, 30);
