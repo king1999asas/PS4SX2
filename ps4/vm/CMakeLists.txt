@@ -8,6 +8,7 @@ option(PCSX2_VM_JIT "Enable the experimental x86 EE/IOP/VU recompilers" ON)
 option(PCSX2_VM_FASTMEM "Enable experimental 4 GiB VTLB fastmem and Orbis fault handling" OFF)
 option(PCSX2_VM_MTVU "Enable experimental multithreaded VU1" ON)
 option(PCSX2_VM_EE_BLOCK_PROFILE "Compile opt-in sampled EE JIT block profiling" OFF)
+set(PCSX2_VM_BUILD_ID "local" CACHE STRING "Build identifier written into runtime logs")
 if(PCSX2_VM_FASTMEM AND NOT PCSX2_VM_JIT)
   message(FATAL_ERROR "PCSX2_VM_FASTMEM requires PCSX2_VM_JIT=ON")
 endif()
@@ -320,7 +321,7 @@ target_include_directories(vm_boot PRIVATE
   ${PCSX2_ROOT}/3rdparty/freesurround/include ${PCSX2_ROOT}/ps4/deps/prefix/include
   ${shaderc_headers_SOURCE_DIR}/libshaderc/include ${glslang_SOURCE_DIR})
 target_compile_definitions(vm_boot PRIVATE PCSX2_PS4=1 PCSX2_PS4_VM_BOOT=1 PS4=1 USE_GLES2=1 BOREALIS_USE_OPENGL=1 $<$<BOOL:${PCSX2_VM_JIT}>:PCSX2_PS4_VM_BOOT_JIT=1> $<$<BOOL:${PCSX2_VM_FASTMEM}>:PCSX2_PS4_VM_BOOT_FASTMEM=1> $<$<BOOL:${PCSX2_VM_MTVU}>:PCSX2_PS4_VM_BOOT_MTVU=1> ENABLE_VULKAN=1 __POSIX__=1 _M_X86=1
-  OVERRIDE_HOST_PAGE_SIZE=0x4000 OVERRIDE_HOST_CACHE_LINE_SIZE=64)
+  OVERRIDE_HOST_PAGE_SIZE=0x4000 OVERRIDE_HOST_CACHE_LINE_SIZE=64 "PCSX2_VM_BUILD_ID=\"${PCSX2_VM_BUILD_ID}\"")
 if(PCSX2_VM_EE_BLOCK_PROFILE)
   target_compile_definitions(vm_boot PRIVATE PCSX2_PS4_VM_EE_BLOCK_PROFILE=1)
 endif()

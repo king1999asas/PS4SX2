@@ -412,7 +412,7 @@ namespace PS4GameMenu
 				{"Normal", "Rápida"}, 2},
 			{"Prioridad de hilos", "Alta evita que el sistema frene al emulador. Se aplica al volver a abrir PS4SX2.",
 				{"Alta", "Normal"}, 2},
-			{"Diagnóstico de rendimiento", "Anota en el log qué gasta la CPU. Juega 2 min en la zona lenta y pasa los logs.",
+			{"Diagnóstico completo", "Activa perfiles EE/JIT, GS/GIF, VU1 e IPU y muestras FPS/tiempos cada segundo. Añade carga; las sesiones se guardan siempre.",
 				{"No", "Sí"}, 2},
 		};
 		bool IsGlobalSetting(size_t id) { return id >= FirstGlobalSetting; }
@@ -480,7 +480,7 @@ namespace PS4GameMenu
 				case 10: return Marker("vm-no-thread-priority") ? 1u : 0u;
 				default:
 					return Marker("vm-ee-hotspots") || Marker("vm-profile-perf") ||
-					       Marker("vm-profile-ee") || Marker("vm-profile-gs") ? 1u : 0u;
+					       Marker("vm-profile-ee") || Marker("vm-profile-gs") || Marker("vm-profile-ipu") ? 1u : 0u;
 			}
 		}
 		void SetSetting(size_t id, unsigned value)
@@ -517,10 +517,16 @@ namespace PS4GameMenu
 				case 9: SetMarker("vm-fast-math", value == 1); break;
 				case 10: SetMarker("vm-no-thread-priority", value == 1); break;
 				default:
+					SetMarker("vm-no-ee-hotspots", false);
+					SetMarker("vm-no-perf-profile", false);
+					SetMarker("vm-no-ee-profile", false);
+					SetMarker("vm-no-gs-profile", false);
+					SetMarker("vm-no-ipu-profile", false);
 					SetMarker("vm-ee-hotspots", value == 1);
 					SetMarker("vm-profile-perf", value == 1);
 					SetMarker("vm-profile-ee", value == 1);
 					SetMarker("vm-profile-gs", value == 1);
+					SetMarker("vm-profile-ipu", value == 1);
 					break;
 			}
 		}
@@ -746,7 +752,7 @@ namespace PS4GameMenu
 				return;
 			for (const char* marker : RiskyMarkers)
 				SetMarker(marker, false);
-			for (const char* marker : {"vm-ee-hotspots", "vm-profile-perf", "vm-profile-ee", "vm-profile-gs"})
+			for (const char* marker : {"vm-ee-hotspots", "vm-profile-perf", "vm-profile-ee", "vm-profile-gs", "vm-profile-ipu"})
 				SetMarker(marker, false);
 			u32 profiles = 0, patches = 0;
 			std::vector<std::string> names;

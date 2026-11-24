@@ -67,10 +67,11 @@ jobs:
           export VM_BUILD_DIR="$RUNNER_TEMP/ps4sx2-build"
           export PCSX2_VM_JIT=ON PCSX2_VM_FASTMEM=ON PCSX2_VM_MTVU=ON
           export PCSX2_VM_EE_BLOCK_PROFILE=${{ inputs.ee_block_profile && 'ON' || 'OFF' }}
+          export PCSX2_VM_BUILD_ID="${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}"
           chmod +x "$OPENORBIS"/bin/*
           bash ps4/vm/build-wsl.sh 2 2>&1 | tee ci-output/compile.log
           cp ps4/vm/build/{eboot.bin,vm_boot,vm_boot.oelf} ci-output/
-          printf 'Commit: %s\nSDK SHA256: %s\nEE JIT block profile: %s\n' "$GITHUB_SHA" "$PS4_SDK_SHA256" "$PCSX2_VM_EE_BLOCK_PROFILE" > ci-output/build-info.txt
+          printf 'Commit: %s\nBuild ID: %s\nSDK SHA256: %s\nEE JIT block profile: %s\nComplete diagnostics include IPU profiling when enabled in launcher settings.\n' "$GITHUB_SHA" "$PCSX2_VM_BUILD_ID" "$PS4_SDK_SHA256" "$PCSX2_VM_EE_BLOCK_PROFILE" > ci-output/build-info.txt
           clang-21 --version >> ci-output/build-info.txt
 
       - name: Upload executable and symbols

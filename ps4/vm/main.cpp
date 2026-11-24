@@ -65,6 +65,10 @@
 #include <ctime>
 #include <pthread.h>
 
+#ifndef PCSX2_VM_BUILD_ID
+#define PCSX2_VM_BUILD_ID "local"
+#endif
+
 static int s_log = -1;
 // pcsx2/CDVD/CDVDcommon.cpp: called with each 2048-byte sector the game reads.
 extern void (*g_ps4_disc_read_hook)(u8* buffer, u32 lsn);
@@ -102,7 +106,7 @@ static int MigrateLegacyLogs()
 {
 	static constexpr const char* names[] = {
 		"PCSX2-vm-boot.log", "PCSX2-vm-stdout.log", "PCSX2-vm-stderr.log",
-		"emulog.txt", "xmb-trace.log", "crash.log"};
+		"emulog.txt", "xmb-trace.log", "crash.log", "session-metrics.csv"};
 	int migrated = 0;
 	mkdir("/data/PS4SX2/logs", 0777);
 	for (const char* name : names)
@@ -160,36 +164,40 @@ static double s_last_log = -5.0;
 static double s_last_input = -1.0;
 static double s_last_pause_log = -5.0;
 
-// (fork) One file on the USB drive to review play sessions on a PC without FTP:
-// /mnt/usbN/logs/PS4SX2-registro.txt. It starts with a short summary of the last
-// game sessions (game, settings, speed, FPS and what held it back), so several
-// setting combinations can be compared, and then holds the full log of the most
-// recent session. It is rewritten every 30 s by a worker thread while a game runs
-// and once more on exit (a crash or a forced close keeps the last copy, and its
-// summary is kept on the next start). The old copies of the separate log files
-// in that folder are deleted, so only this file remains. Menu-only sessions never
-// touch the USB.
+// Keep all game sessions under /mnt/usbN/logs/sessions/<session-id>/, with a
+// summary and the full independent logs. The active folder is refreshed every
+// 30 s and on exit; completed folders are never removed. Archived on-device
+// sessions are synchronized to the USB when it next becomes writable.
 static bool s_game_session = false;
 static double s_last_usb_copy = 0.0;
+static std::atomic<bool> s_detailed_session_metrics{false};
+
+bool PS4SessionStatsDetailedSamplingRequested()
+{
+	return s_detailed_session_metrics.load(std::memory_order_relaxed);
+}
 
 namespace SessionSummary
 {
 	constexpr const char* HistoryPath = "/data/PS4SX2/session-history.txt";
 	constexpr const char* CurrentPath = "/data/PS4SX2/session-current.txt";
 	constexpr const char* Separator = "------------------------------------------------------------\n";
-	constexpr size_t MaxHistory = 10;
 
 	struct Sample
 	{
-		float t, speed, fps, ee, gs, vu1, gpu;
+		float t, ps2_hz, speed, fps, frame_ms, frame_max_ms;
+		float ee, ee_ms, gs, gs_ms, vu1, vu1_ms, gpu, gpu_ms;
 	};
 	static std::mutex s_mutex;
 	static std::vector<Sample> s_samples;
 	static std::vector<float> s_marks;
 	static Common::Timer::Value s_start = 0;
-	static std::string s_title, s_serial, s_date;
+	static std::string s_title, s_serial, s_date, s_stamp;
 	static std::string s_settings = "Ajustes: no registrados\n";
 	static bool s_active = false;
+	static size_t s_metrics_flushed = 0;
+	static bool s_metrics_header_written = false;
+	static constexpr const char* MetricsPath = "/data/PS4SX2/logs/session-metrics.csv";
 
 	static float Elapsed() // caller holds s_mutex
 	{
@@ -212,87 +220,216 @@ namespace SessionSummary
 
 	static void WriteFile(const char* path, const std::string& text)
 	{
-		const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		char temporary[256];
+		std::snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+		const int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 		if (fd < 0)
 			return;
-		if (!text.empty())
-			(void)!write(fd, text.data(), text.size());
+		size_t written = 0;
+		while (written < text.size())
+		{
+			const ssize_t count = write(fd, text.data() + written, text.size() - written);
+			if (count < 0 && errno == EINTR)
+				continue;
+			if (count <= 0)
+				break;
+			written += static_cast<size_t>(count);
+		}
+		const bool complete = written == text.size();
+		const bool synced = fsync(fd) == 0;
 		close(fd);
+		if (complete && synced)
+			(void)rename(temporary, path);
+		else
+			unlink(temporary);
 	}
 
-	// Keeps the last MaxHistory entries, each followed by Separator.
+	// Keep every completed summary. Raw session archives are stored beside logs.
 	static void AppendHistory(const std::string& entry)
 	{
 		if (entry.empty())
 			return;
-		const std::string history = ReadFile(HistoryPath);
-		std::vector<std::string> entries;
-		for (size_t begin = 0; begin < history.size();)
+		const int fd = open(HistoryPath, O_WRONLY | O_CREAT | O_APPEND, 0666);
+		if (fd < 0)
+			return;
+		const std::string text = entry + Separator;
+		size_t written = 0;
+		while (written < text.size())
 		{
-			const size_t end = history.find(Separator, begin);
-			if (end == std::string::npos)
+			const ssize_t count = write(fd, text.data() + written, text.size() - written);
+			if (count < 0 && errno == EINTR)
+				continue;
+			if (count <= 0)
 				break;
-			entries.push_back(history.substr(begin, end - begin));
-			begin = end + std::strlen(Separator);
+			written += static_cast<size_t>(count);
 		}
-		entries.push_back(entry);
-		const size_t first = entries.size() > MaxHistory ? entries.size() - MaxHistory : 0;
-		std::string text;
-		for (size_t i = first; i < entries.size(); ++i)
-			text += entries[i] + Separator;
-		WriteFile(HistoryPath, text);
+		fsync(fd);
+		close(fd);
+	}
+
+	static bool WriteAll(int fd, const char* data, size_t size)
+	{
+		size_t written = 0;
+		while (written < size)
+		{
+			const ssize_t count = write(fd, data + written, size - written);
+			if (count < 0 && errno == EINTR)
+				continue;
+			if (count <= 0)
+				return false;
+			written += static_cast<size_t>(count);
+		}
+		return true;
+	}
+
+	static std::string CsvField(const std::string& value)
+	{
+		std::string result = "\"";
+		for (const char c : value)
+		{
+			if (c == '"')
+				result += "\"\"";
+			else if (c != '\r' && c != '\n')
+				result += c;
+		}
+		result += '"';
+		return result;
+	}
+
+	// Persist new samples on the archive worker, not on the GS thread that supplies them.
+	// A failed write leaves the sample cursor unchanged so the next flush retries it.
+	static bool FlushMetrics()
+	{
+		std::string batch;
+		size_t next_sample = 0;
+		bool add_session_header = false;
+		std::string started, title, serial;
+		{
+			std::lock_guard lock(s_mutex);
+			next_sample = s_samples.size();
+			if (s_metrics_header_written && next_sample == s_metrics_flushed)
+				return true;
+			add_session_header = !s_metrics_header_written;
+			started = s_stamp;
+			title = s_title;
+			serial = s_serial;
+			if (add_session_header)
+				batch += "# SESSION started=" + started + " title=" + CsvField(title) + " serial=" + CsvField(serial) + "\n";
+			for (size_t i = s_metrics_flushed; i < next_sample; ++i)
+			{
+				const Sample& sample = s_samples[i];
+				char row[512];
+				const int length = std::snprintf(row, sizeof(row),
+					"%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+					sample.t, sample.ps2_hz, sample.speed, sample.fps, sample.frame_ms, sample.frame_max_ms,
+					sample.ee, sample.ee_ms, sample.gs, sample.gs_ms, sample.vu1, sample.vu1_ms, sample.gpu, sample.gpu_ms);
+				if (length <= 0 || static_cast<size_t>(length) >= sizeof(row))
+					return false;
+				batch.append(row, static_cast<size_t>(length));
+			}
+		}
+
+		const int fd = open(MetricsPath, O_WRONLY | O_CREAT | O_APPEND, 0666);
+		if (fd < 0)
+			return false;
+		struct stat st{};
+		bool ok = fstat(fd, &st) == 0;
+		if (ok && st.st_size == 0)
+			batch.insert(0, "elapsed_s,ps2_hz,speed_pct,game_fps,frame_ms,frame_max_ms,ee_pct,ee_ms,gs_pct,gs_ms,vu1_pct,vu1_ms,gpu_pct,gpu_ms\n");
+		ok = ok && WriteAll(fd, batch.data(), batch.size()) && fsync(fd) == 0;
+		close(fd);
+		if (!ok)
+			return false;
+		{
+			std::lock_guard lock(s_mutex);
+			s_metrics_flushed = std::max(s_metrics_flushed, next_sample);
+			s_metrics_header_written = s_metrics_header_written || add_session_header;
+		}
+		return true;
 	}
 
 	// A session that ended without going through the menu (PS button, crash) left
 	// its last snapshot behind; keep it in the history.
-	static void KeepLeftover()
+	static std::string KeepLeftover()
 	{
 		const std::string leftover = ReadFile(CurrentPath);
 		if (!leftover.empty())
 			AppendHistory(leftover);
 		unlink(CurrentPath);
+		unlink("/data/PS4SX2/session-current.txt.tmp");
+		return leftover;
 	}
 
 	static void Begin()
 	{
-		std::lock_guard lock(s_mutex);
-		s_samples.clear();
-		s_marks.clear();
-		s_start = Common::Timer::GetCurrentValue();
-		const time_t now = time(nullptr);
-		struct tm local{};
-		char date[32] = "";
-		if (localtime_r(&now, &local))
-			strftime(date, sizeof(date), "%d/%m/%Y %H:%M", &local);
-		s_date = date;
-		s_active = true;
+		std::string started;
+		{
+			std::lock_guard lock(s_mutex);
+			s_samples.clear();
+			s_marks.clear();
+			s_start = Common::Timer::GetCurrentValue();
+			const time_t now = time(nullptr);
+			struct tm local{};
+			char date[32] = "";
+			char stamp[32] = "";
+			if (localtime_r(&now, &local))
+			{
+				strftime(date, sizeof(date), "%d/%m/%Y %H:%M", &local);
+				strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
+			}
+			s_date = date;
+			s_stamp = stamp;
+			s_title.clear();
+			s_serial.clear();
+			s_active = true;
+			s_metrics_flushed = 0;
+			s_metrics_header_written = false;
+			started = s_stamp;
+		}
+		PS4SessionLogs::UpdateGameMetadata(started.c_str(), nullptr, nullptr);
 	}
 
 	static void RefreshGame()
 	{
 		std::string title = VMManager::GetTitle(true);
 		std::string serial = VMManager::GetDiscSerial();
-		std::lock_guard lock(s_mutex);
-		if (!title.empty())
-			s_title = std::move(title);
-		if (!serial.empty())
-			s_serial = std::move(serial);
+		std::string metadata_title, metadata_serial, metadata_started;
+		{
+			std::lock_guard lock(s_mutex);
+			if (!title.empty())
+				s_title = std::move(title);
+			if (!serial.empty())
+				s_serial = std::move(serial);
+			metadata_title = s_title;
+			metadata_serial = s_serial;
+			metadata_started = s_stamp;
+		}
+		PS4SessionLogs::UpdateGameMetadata(metadata_started.c_str(), metadata_serial.c_str(), metadata_title.c_str());
+	}
+
+	static std::string DirectoryName()
+	{
+		return PS4SessionLogs::CurrentDirectoryName();
 	}
 
 	static void Mark()
 	{
 		std::lock_guard lock(s_mutex);
-		if (s_active && s_marks.size() < 64)
+		if (s_active)
 			s_marks.push_back(Elapsed());
 	}
 
-	static void Add(double speed, double fps, double ee, double gs, double vu1, double gpu)
+	static void Add(double ps2_hz, double speed, double fps, double frame_ms, double frame_max_ms,
+		             double ee, double ee_ms, double gs, double gs_ms, double vu1, double vu1_ms,
+		             double gpu, double gpu_ms)
 	{
 		std::lock_guard lock(s_mutex);
-		if (!s_active || speed < 1.0 || s_samples.size() >= 8192)
-			return; // paused, or more than 11 hours
-		s_samples.push_back({Elapsed(), static_cast<float>(speed), static_cast<float>(fps), static_cast<float>(ee),
-			static_cast<float>(gs), static_cast<float>(vu1), static_cast<float>(gpu)});
+		if (!s_active)
+			return;
+		s_samples.push_back({Elapsed(), static_cast<float>(ps2_hz), static_cast<float>(speed), static_cast<float>(fps),
+			static_cast<float>(frame_ms), static_cast<float>(frame_max_ms), static_cast<float>(ee), static_cast<float>(ee_ms),
+			static_cast<float>(gs), static_cast<float>(gs_ms), static_cast<float>(vu1), static_cast<float>(vu1_ms),
+			static_cast<float>(gpu), static_cast<float>(gpu_ms)});
 	}
 
 	static void SetSettings(int ee_rate, int ee_skip, bool fast_cdvd, bool fast_boot, bool audio, int download_mode,
@@ -331,6 +468,9 @@ namespace SessionSummary
 			fast_math ? "rápida" : "normal", audio ? "sí" : "no", fast_boot ? "saltar" : "mostrar");
 		std::string text = line;
 		text += "Parches: " + join(patches) + " · Trucos: " + join(cheats) + "\n";
+		const bool diagnostics = marker("vm-ee-hotspots") || marker("vm-profile-perf") ||
+			marker("vm-profile-ee") || marker("vm-profile-gs") || marker("vm-profile-ipu");
+		text += diagnostics ? "Diagnóstico completo: sí (EE/JIT, eventos EE, GS/GIF e IPU)\n" : "Diagnóstico completo: no\n";
 		std::lock_guard lock(s_mutex);
 		s_settings = std::move(text);
 	}
@@ -426,24 +566,27 @@ namespace SessionSummary
 	}
 } // namespace SessionSummary
 
-void PS4SessionStatsAdd(double speed, double fps, double ee, double gs, double vu1, double gpu)
+void PS4SessionStatsAdd(double ps2_hz, double speed, double fps, double frame_ms, double frame_max_ms,
+	                   double ee, double ee_ms, double gs, double gs_ms, double vu1, double vu1_ms,
+	                   double gpu, double gpu_ms)
 {
-	SessionSummary::Add(speed, fps, ee, gs, vu1, gpu);
+	SessionSummary::Add(ps2_hz, speed, fps, frame_ms, frame_max_ms, ee, ee_ms, gs, gs_ms, vu1, vu1_ms, gpu, gpu_ms);
 }
 
 namespace UsbLog
 {
-	constexpr const char* FileName = "PS4SX2-registro.txt";
-	constexpr const char* SourcePath = "/data/PS4SX2/logs/PCSX2-vm-boot.log";
+	constexpr const char* InternalSessionsPath = "/data/PS4SX2/logs/sessions";
+	constexpr const char* LiveLogsPath = "/data/PS4SX2/logs";
 	static std::mutex s_copy_mutex; // held while the USB file is written
 	static std::mutex s_request_mutex;
 	static std::condition_variable s_request_cv;
 	static bool s_requested = false;
-	static std::string s_requested_entry, s_requested_leftover;
+	static std::string s_requested_entry, s_requested_leftover, s_requested_session_name;
 	static std::atomic<bool> s_closing{false};
 	static bool s_thread_tried = false;
 	static int s_thread_result = -1;
-	static bool s_cleaned = false;
+	static bool s_archive_sync_done = false;
+	static std::string s_usb_session_name;
 	static int s_last_state = 0;
 	static char s_buffer[64 * 1024]; // used only under s_copy_mutex
 
@@ -470,69 +613,367 @@ namespace UsbLog
 		return {};
 	}
 
-	static void RemoveOldCopies(const std::string& dir)
+	static bool EnsureDirectory(const std::string& path)
 	{
-		static constexpr const char* files[] = {"PCSX2-vm-boot.log", "PCSX2-vm-stdout.log", "PCSX2-vm-stderr.log",
-			"emulog.txt", "session-platform.txt", "xmb-trace.log", "legacy-xmb-trace.log"};
-		for (const char* sub : {"", "/last-game-PS2", "/last-game-PS1", "/previous-menu"})
-		{
-			const std::string folder = dir + sub;
-			for (const char* file : files)
-				unlink((folder + "/" + file).c_str());
-			if (*sub)
-				rmdir(folder.c_str()); // only succeeds if nothing else is left in it
-		}
+		if (mkdir(path.c_str(), 0777) == 0)
+			return true;
+		if (errno != EEXIST)
+			return false;
+		struct stat st{};
+		return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 	}
 
-	// Summary of the last sessions (and of the current one, if given), then the
-	// full log. Caller holds s_copy_mutex. Returns 1 on success, or <0 on failure.
-	static int CopyNow(const std::string& current_entry, std::string& why)
+	static bool WriteTextAtomic(const std::string& target, const std::string& text)
+	{
+		const std::string temporary = target + ".tmp";
+		const int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (fd < 0)
+			return false;
+		size_t written = 0;
+		while (written < text.size())
+		{
+			const ssize_t count = write(fd, text.data() + written, text.size() - written);
+			if (count < 0 && errno == EINTR)
+				continue;
+			if (count <= 0)
+				break;
+			written += static_cast<size_t>(count);
+		}
+		const bool complete = written == text.size();
+		const bool synced = fsync(fd) == 0;
+		close(fd);
+		if (!complete || !synced || rename(temporary.c_str(), target.c_str()) != 0)
+		{
+			unlink(temporary.c_str());
+			return false;
+		}
+		return true;
+	}
+
+	// A destination is replaced only after a full, synced copy. Missing optional logs are normal.
+	static bool CopyFileAtomic(const std::string& source, const std::string& target, bool& missing)
+	{
+		missing = false;
+		const int in = open(source.c_str(), O_RDONLY);
+		if (in < 0)
+		{
+			missing = errno == ENOENT;
+			return missing;
+		}
+		const std::string temporary = target + ".tmp";
+		const int out = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (out < 0)
+		{
+			close(in);
+			return false;
+		}
+		bool ok = true;
+		for (;;)
+		{
+			const ssize_t count = read(in, s_buffer, sizeof(s_buffer));
+			if (count == 0)
+				break;
+			if (count < 0)
+			{
+				if (errno == EINTR)
+					continue;
+				ok = false;
+				break;
+			}
+			size_t written = 0;
+			while (written < static_cast<size_t>(count))
+			{
+				const ssize_t amount = write(out, s_buffer + written, static_cast<size_t>(count) - written);
+				if (amount < 0 && errno == EINTR)
+					continue;
+				if (amount <= 0)
+				{
+					ok = false;
+					break;
+				}
+				written += static_cast<size_t>(amount);
+			}
+			if (!ok)
+				break;
+		}
+		ok = fsync(out) == 0 && ok;
+		close(in);
+		close(out);
+		if (ok && rename(temporary.c_str(), target.c_str()) == 0)
+			return true;
+		unlink(temporary.c_str());
+		return false;
+	}
+
+	// Append only the bytes added since the last snapshot; the final copy replaces
+	// the file atomically. This keeps 30-second crash snapshots from rewriting large logs.
+	static bool CopyGrowingFile(const std::string& source, const std::string& target, bool final_snapshot)
+	{
+		if (final_snapshot)
+		{
+			bool missing = false;
+			return CopyFileAtomic(source, target, missing);
+		}
+		const int in = open(source.c_str(), O_RDONLY);
+		if (in < 0)
+			return errno == ENOENT;
+		struct stat source_stat{}, target_stat{};
+		if (fstat(in, &source_stat) != 0)
+		{
+			close(in);
+			return false;
+		}
+		if (stat(target.c_str(), &target_stat) != 0)
+		{
+			close(in);
+			bool missing = false;
+			return errno == ENOENT ? CopyFileAtomic(source, target, missing) : false;
+		}
+		// The live marker is rewritten in place between snapshots; other logs grow
+		// by appending, so a length match means there are no new bytes to transfer.
+		if (source_stat.st_size == target_stat.st_size && source.substr(source.find_last_of('/') + 1) != "session-platform.txt")
+		{
+			close(in);
+			return true;
+		}
+		if (source_stat.st_size < target_stat.st_size || source.substr(source.find_last_of('/') + 1) == "session-platform.txt")
+		{
+			close(in);
+			bool missing = false;
+			return CopyFileAtomic(source, target, missing);
+		}
+		if (lseek(in, target_stat.st_size, SEEK_SET) < 0)
+		{
+			close(in);
+			return false;
+		}
+		const int out = open(target.c_str(), O_WRONLY | O_APPEND);
+		if (out < 0)
+		{
+			close(in);
+			return false;
+		}
+		bool ok = true;
+		off_t remaining = source_stat.st_size - target_stat.st_size;
+		while (remaining > 0)
+		{
+			const size_t capacity = static_cast<size_t>(std::min<off_t>(remaining, sizeof(s_buffer)));
+			const ssize_t count = read(in, s_buffer, capacity);
+			if (count < 0 && errno == EINTR)
+				continue;
+			if (count <= 0)
+			{
+				ok = false;
+				break;
+			}
+			size_t written = 0;
+			while (written < static_cast<size_t>(count))
+			{
+				const ssize_t amount = write(out, s_buffer + written, static_cast<size_t>(count) - written);
+				if (amount < 0 && errno == EINTR)
+					continue;
+				if (amount <= 0)
+				{
+					ok = false;
+					break;
+				}
+				written += static_cast<size_t>(amount);
+			}
+			if (!ok)
+				break;
+			remaining -= count;
+		}
+		ok = fsync(out) == 0 && ok;
+		close(in);
+		close(out);
+		return ok;
+	}
+
+	static bool CopyCurrentLogs(const std::string& target_dir, bool final_snapshot)
+	{
+		if (!EnsureDirectory(target_dir))
+			return false;
+		DIR* source_dir = opendir(LiveLogsPath);
+		if (!source_dir)
+			return errno == ENOENT;
+		bool ok = true;
+		while (dirent* entry = readdir(source_dir))
+		{
+			if (entry->d_name[0] == '.' && (!entry->d_name[1] ||
+			    (entry->d_name[1] == '.' && !entry->d_name[2])))
+				continue;
+			if (std::strcmp(entry->d_name, "session-summary.txt") == 0)
+				continue;
+			const std::string source = std::string(LiveLogsPath) + "/" + entry->d_name;
+			struct stat st{};
+			if (stat(source.c_str(), &st) != 0)
+			{
+				if (errno != ENOENT)
+					ok = false;
+				continue;
+			}
+			if (!S_ISREG(st.st_mode))
+				continue;
+			const std::string target = target_dir + "/" + entry->d_name;
+			if (!CopyGrowingFile(source, target, final_snapshot))
+				ok = false;
+		}
+		closedir(source_dir);
+		return ok;
+	}
+
+	static bool CopySessionFiles(const std::string& source_dir, const std::string& target_dir)
+	{
+		if (!EnsureDirectory(target_dir))
+			return false;
+		DIR* source_root = opendir(source_dir.c_str());
+		if (!source_root)
+			return errno == ENOENT;
+		bool ok = true;
+		while (dirent* entry = readdir(source_root))
+		{
+			if (entry->d_name[0] == '.' && (!entry->d_name[1] ||
+			    (entry->d_name[1] == '.' && !entry->d_name[2])))
+				continue;
+			const std::string source = source_dir + "/" + entry->d_name;
+			const std::string target = target_dir + "/" + entry->d_name;
+			struct stat source_stat{}, target_stat{};
+			if (stat(source.c_str(), &source_stat) != 0)
+			{
+				if (errno != ENOENT)
+					ok = false;
+				continue;
+			}
+			if (!S_ISREG(source_stat.st_mode))
+				continue;
+			const bool replace_small_metadata = std::strcmp(entry->d_name, "session-info.txt") == 0 ||
+			                                     std::strcmp(entry->d_name, "session-summary.txt") == 0;
+			if (!replace_small_metadata && stat(target.c_str(), &target_stat) == 0 &&
+			    target_stat.st_size == source_stat.st_size)
+				continue;
+			bool missing = false;
+			if (!CopyFileAtomic(source, target, missing))
+				ok = false;
+		}
+		closedir(source_root);
+		return ok;
+	}
+
+	// Attach final metadata after the internal archive is finalized at process exit.
+	// The raw logs have already been copied by Final(), so only these small files
+	// need a second pass here.
+	static bool SyncFinalMetadata(const std::string& archive_dir)
+	{
+		const size_t slash = archive_dir.find_last_of('/');
+		if (slash == std::string::npos || slash + 1 >= archive_dir.size())
+			return false;
+		std::string why;
+		const std::string usb_logs = FindTargetDir(why);
+		if (usb_logs.empty())
+			return false;
+		const std::string usb_session = usb_logs + "/sessions/" + archive_dir.substr(slash + 1);
+		if (!EnsureDirectory(usb_session))
+			return false;
+		for (const char* name : {"session-info.txt", "session-summary.txt"})
+		{
+			bool missing = false;
+			if (!CopyFileAtomic(archive_dir + "/" + name, usb_session + "/" + name, missing))
+				return false;
+		}
+		return true;
+	}
+
+	// Flush all archived sessions that were created while no USB was mounted.
+	static bool SyncArchivedSessions(const std::string& usb_logs_dir)
+	{
+		DIR* source_root = opendir(InternalSessionsPath);
+		if (!source_root)
+			return errno == ENOENT;
+		const std::string usb_sessions = usb_logs_dir + "/sessions";
+		if (!EnsureDirectory(usb_sessions))
+		{
+			closedir(source_root);
+			return false;
+		}
+		bool ok = true;
+		while (dirent* entry = readdir(source_root))
+		{
+			if (entry->d_name[0] == '.' && (!entry->d_name[1] ||
+			    (entry->d_name[1] == '.' && !entry->d_name[2])))
+				continue;
+			const std::string source = std::string(InternalSessionsPath) + "/" + entry->d_name;
+			struct stat st{};
+			if (stat(source.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+				continue;
+			const std::string target = usb_sessions + "/" + entry->d_name;
+			if (!CopySessionFiles(source, target))
+				ok = false;
+		}
+		closedir(source_root);
+		return ok;
+	}
+
+	static std::string UniqueUsbSessionDir(const std::string& usb_logs_dir, const std::string& session_name)
+	{
+		const std::string sessions = usb_logs_dir + "/sessions";
+		if (!EnsureDirectory(sessions))
+			return {};
+		if (s_usb_session_name.empty())
+		{
+			for (unsigned collision = 0; collision < 10000; ++collision)
+			{
+				std::string candidate = session_name;
+				if (collision)
+					candidate += "_" + std::to_string(collision + 1);
+				const std::string path = sessions + "/" + candidate;
+				if (mkdir(path.c_str(), 0777) == 0)
+				{
+					s_usb_session_name = std::move(candidate);
+					return path;
+				}
+				if (errno != EEXIST)
+					return {};
+			}
+			return {};
+		}
+		const std::string path = sessions + "/" + s_usb_session_name;
+		return EnsureDirectory(path) ? path : std::string();
+	}
+
+	// One durable directory per session; 30 s snapshots append only the new log bytes.
+	static int CopyNow(const std::string& current_entry, const std::string& session_name, bool final_snapshot,
+	                   std::string& why)
 	{
 		const std::string dir = FindTargetDir(why);
 		if (dir.empty())
 			return -1;
-		const int in = open(SourcePath, O_RDONLY);
-		if (in < 0)
+		if (!s_archive_sync_done)
 		{
-			why = " " + std::string(SourcePath) + " errno=" + std::to_string(errno);
+			if (SyncArchivedSessions(dir))
+				s_archive_sync_done = true;
+			else
+				ProbeLog("USB log: some archived sessions could not be synchronized; will retry\n");
+		}
+		std::string desired_session_name = session_name.empty() ? PS4SessionLogs::CurrentDirectoryName() : session_name;
+		if (desired_session_name.empty())
+			desired_session_name = "untracked_" + std::to_string(static_cast<int>(getpid())) + "_" +
+				std::to_string(static_cast<long long>(time(nullptr)));
+		const std::string session_dir = UniqueUsbSessionDir(dir, desired_session_name);
+		if (session_dir.empty())
+		{
+			why = " " + dir + "/sessions (directory create failed)";
 			return -2;
 		}
-		const std::string target = dir + "/" + FileName;
-		const int out = open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-		if (out < 0)
+		bool ok = CopyCurrentLogs(session_dir, final_snapshot);
+		if (!WriteTextAtomic(session_dir + "/session-summary.txt", current_entry))
+			ok = false;
+		if (!ok)
 		{
-			why = " " + target + " errno=" + std::to_string(errno);
-			close(in);
+			why = " " + session_dir + " (one or more files could not be saved)";
 			return -3;
 		}
-		std::string header = "\xEF\xBB\xBFPS4SX2 · registro para revisar en el PC\n\n"
-		                     "RESUMEN DE LAS ÚLTIMAS PARTIDAS (la más reciente al final)\n";
-		header += SessionSummary::Separator;
-		header += SessionSummary::ReadFile(SessionSummary::HistoryPath);
-		if (!current_entry.empty())
-			header += current_entry + SessionSummary::Separator;
-		header += "\nREGISTRO COMPLETO DE LA PARTIDA MÁS RECIENTE\n";
-		header += SessionSummary::Separator;
-		int result = write(out, header.data(), header.size()) == static_cast<ssize_t>(header.size()) ? 1 : -4;
-		ssize_t n;
-		while (result > 0 && (n = read(in, s_buffer, sizeof(s_buffer))) > 0)
-		{
-			if (write(out, s_buffer, static_cast<size_t>(n)) != n)
-				result = -4;
-		}
-		if (result < 0)
-			why = " " + target + " write errno=" + std::to_string(errno);
-		close(in);
-		fsync(out);
-		close(out);
-		if (!s_cleaned)
-		{
-			RemoveOldCopies(dir);
-			s_cleaned = true;
-		}
-		if (result > 0)
-			why = target;
-		return result;
+		why = session_dir;
+		return s_archive_sync_done ? 1 : 2;
 	}
 
 	// Logs the outcome when it changes (first copy, USB plugged or removed).
@@ -541,8 +982,10 @@ namespace UsbLog
 		if (state == s_last_state)
 			return;
 		s_last_state = state;
-		if (state > 0)
-			ProbeLog("USB log: summary and log copied to %s every 30 s\n", why.c_str());
+		if (state == 1)
+			ProbeLog("USB log: this session and all archived sessions saved under %s\n", why.c_str());
+		else if (state == 2)
+			ProbeLog("USB log: current session saved under %s; archived sessions still pending\n", why.c_str());
 		else if (state == -1)
 			ProbeLog("USB log: no writable USB drive found (/mnt/usb0-7):%s\n", why.c_str());
 		else
@@ -554,31 +997,36 @@ namespace UsbLog
 		for (;;)
 		{
 			std::string entry, leftover;
+			std::string session_name;
 			{
 				std::unique_lock lock(s_request_mutex);
 				s_request_cv.wait(lock, [] { return s_requested; });
 				s_requested = false;
 				entry.swap(s_requested_entry);
 				leftover.swap(s_requested_leftover);
+				session_name.swap(s_requested_session_name);
 			}
 			std::lock_guard copy_lock(s_copy_mutex);
 			if (s_closing.load(std::memory_order_acquire))
 				continue;
 			SessionSummary::WriteFile(SessionSummary::CurrentPath, leftover);
 			std::string why;
-			Report(CopyNow(entry, why), why);
+			if (!SessionSummary::FlushMetrics())
+				ProbeLog("Session metrics: flush failed; will retry on the next snapshot or exit\n");
+			Report(CopyNow(entry, session_name, false, why), why);
 		}
 		return nullptr;
 	}
 
-	// From the EE thread: snapshot the current session and copy it in the background.
+	// From the EE thread: snapshot this session and all pending archives in the background.
 	static void Request()
 	{
-		std::string entry, leftover;
+		std::string entry, leftover, session_name;
 		{
 			std::lock_guard lock(SessionSummary::s_mutex);
 			entry = SessionSummary::Build("en curso");
 			leftover = SessionSummary::Build("cerrada sin salir desde el menú (botón PS o cuelgue)");
+			session_name = SessionSummary::DirectoryName();
 		}
 		if (!s_thread_tried)
 		{
@@ -594,30 +1042,33 @@ namespace UsbLog
 				pthread_attr_destroy(&attr);
 			}
 			if (s_thread_result != 0)
-				ProbeLog("USB log: copy thread failed to start (error %d); the USB copy is made on exit only\n", s_thread_result);
+				ProbeLog("USB log: copy thread failed to start (error %d); archive sync will run on exit\n", s_thread_result);
 		}
 		if (s_thread_result != 0)
 		{
 			SessionSummary::WriteFile(SessionSummary::CurrentPath, leftover);
+			if (!SessionSummary::FlushMetrics())
+				ProbeLog("Session metrics: fallback flush failed; root log preserved for next startup archive\n");
 			return;
 		}
 		{
 			std::lock_guard lock(s_request_mutex);
 			s_requested_entry = std::move(entry);
 			s_requested_leftover = std::move(leftover);
+			s_requested_session_name = std::move(session_name);
 			s_requested = true;
 		}
 		s_request_cv.notify_one();
 	}
 
-	// On exit, after the log file is complete and closed: the finished session joins
-	// the history and the USB file is written one last time.
-	static void Final()
+	// On exit, after the log file is complete and closed: save this session and return its summary.
+	static std::string Final()
 	{
-		std::string entry;
+		std::string entry, session_name;
 		{
 			std::lock_guard lock(SessionSummary::s_mutex);
 			entry = SessionSummary::Build("cerrada desde el menú");
+			session_name = SessionSummary::DirectoryName();
 		}
 		s_closing.store(true, std::memory_order_release);
 		bool locked = false;
@@ -626,10 +1077,13 @@ namespace UsbLog
 		SessionSummary::AppendHistory(entry);
 		unlink(SessionSummary::CurrentPath);
 		if (!locked)
-			return; // a USB write is stuck; the history is kept for the next copy
+			return entry; // a USB write is stuck; the history is kept for the next copy
+		if (!SessionSummary::FlushMetrics())
+			ProbeLog("Session metrics: final flush failed; root log preserved for next startup archive\n");
 		std::string why;
-		CopyNow(std::string(), why);
+		Report(CopyNow(entry, session_name, true, why), why);
 		s_copy_mutex.unlock();
+		return entry;
 	}
 } // namespace UsbLog
 static u32 s_last_ee_cycle = 0;
@@ -1330,11 +1784,16 @@ static void* RunVM(void*)
 	PS4ThreadAffinity::PinCurrentThread("EE", 2);
 	VMHostSetCPUThread();
 	PS4ThreadCPUMetrics::Sample(PS4ThreadCPUMetrics::Role::EE);
-	PS4IPUProfile::s_sampling.enabled = access("/data/PS4SX2/vm-profile-ipu", F_OK) == 0 &&
+	const bool ipu_profile_requested = access("/data/PS4SX2/vm-profile-ipu", F_OK) == 0 ||
+	                                   access("/data/PS4SX2/vm-profile-perf", F_OK) == 0 ||
+	                                   access("/data/PS4SX2/vm-profile-ee", F_OK) == 0 ||
+	                                   access("/data/PS4SX2/vm-profile-gs", F_OK) == 0 ||
+	                                   access("/data/PS4SX2/vm-ee-hotspots", F_OK) == 0 || s_verbose_diag;
+	PS4IPUProfile::s_sampling.enabled = ipu_profile_requested &&
 	                                    access("/data/PS4SX2/vm-no-ipu-profile", F_OK) != 0;
 	PS4IPUProfile::s_access_sampling.enabled = PS4IPUProfile::s_sampling.enabled;
-	ProbeLog("IPU profiling: %s (sampled duration, nominal ratio 1/%u)\n",
-		PS4IPUProfile::s_sampling.enabled ? "enabled by opt-in marker with inclusive access sampling 1/1024" : "disabled for performance",
+	ProbeLog("IPU profiling: %s (duration ratio 1/%u; accesses 1/1024; disable with /data/PS4SX2/vm-no-ipu-profile)\n",
+		PS4IPUProfile::s_sampling.enabled ? "enabled by complete-diagnostics marker" : "disabled for performance",
 		PS4IPUProfile::SAMPLE_WEIGHT);
 	static MemorySettingsInterface settings_storage;
 	static MemorySettingsInterface secrets_storage;
@@ -1456,6 +1915,10 @@ static void* RunVM(void*)
 	PrepareEmulatorFolders(*settings);
 	const bool performance_profile = access("/data/PS4SX2/vm-profile-perf", F_OK) == 0 &&
 	                                 access("/data/PS4SX2/vm-no-perf-profile", F_OK) != 0;
+	s_detailed_session_metrics.store(performance_profile || s_verbose_diag ||
+		(access("/data/PS4SX2/vm-ee-hotspots", F_OK) == 0 && access("/data/PS4SX2/vm-no-ee-hotspots", F_OK) != 0) ||
+		access("/data/PS4SX2/vm-profile-ee", F_OK) == 0 || access("/data/PS4SX2/vm-profile-gs", F_OK) == 0 ||
+		access("/data/PS4SX2/vm-profile-ipu", F_OK) == 0, std::memory_order_relaxed);
 	const bool gs_profile_opt_in = access("/data/PS4SX2/vm-profile-gs", F_OK) == 0 ||
 	                               performance_profile || s_verbose_diag;
 	const bool gs_profile_disabled = access("/data/PS4SX2/vm-no-gs-profile", F_OK) == 0;
@@ -1658,6 +2121,7 @@ static void* RunVM(void*)
 		s_game_session = true;
 		SessionSummary::Begin();
 		SessionSummary::RefreshGame();
+		UsbLog::Request(); // save metadata and start syncing prior sessions immediately
 		while (VMManager::GetState() != VMState::Stopping && VMManager::GetState() != VMState::Shutdown)
 		{
 			if (VMManager::GetState() == VMState::Paused)
@@ -1700,8 +2164,8 @@ int main()
 	// (AI-assisted) Keep all runtime diagnostics together for FTP collection.
 	mkdir("/data/PS4SX2/logs", 0777);
 	const int migrated_logs = MigrateLegacyLogs();
-	const auto archived_logs = PS4SessionLogs::ArchivePrevious();
-	SessionSummary::KeepLeftover();
+	const std::string leftover_summary = SessionSummary::KeepLeftover();
+	const auto archived_logs = PS4SessionLogs::ArchivePrevious(leftover_summary.c_str());
 	// If archiving fails, append rather than destroying the remaining evidence.
 	const int log_flags = O_WRONLY | O_CREAT | (archived_logs.error ? O_APPEND : O_TRUNC);
 	// (AI-assisted) Redirect descriptors without reopening or altering libc FILE
@@ -1728,11 +2192,12 @@ int main()
 	const bool telemetry_started = PS4Telemetry::Start();
 	// Record entry before module loading, so a stalled re-launch still has a startup marker.
 	ProbeLog("PS4SX2 Emu 1.00 CHD (AI-assisted) BUILD: PS4SX2-EMU-1.00-CHD-SMC-TELEMETRY\n");
+	ProbeLog("PS4SX2 build id: %s\n", PCSX2_VM_BUILD_ID);
 	ProbeLog("Telemetry: start=%d\n", telemetry_started ? 1 : 0);
 	PS4Telemetry::Stage("boot");
 	ProbeLog("Telemetry: PC debug server target from /data/PS4SX2/telemetry.conf (create with 'host=PC_IP port=19423')\n");
 	ProbeLog("Log directory: /data/PS4SX2/logs migrated=%d\n", migrated_logs);
-	ProbeLog("Session archive: directory=%s moved=%d errno=%d\n",
+	ProbeLog("Session archive: directory=%s moved=%d errno=%d (all sessions retained)\n",
 		archived_logs.directory, archived_logs.moved, archived_logs.error);
 	ProbeLog("PS4 log startup: fd=%d synchronous_marker=%d kernel_mirror=%d thread_result=%d verbose=%d\n", s_log, synchronous_log, kernel_log, log_thread_result, s_verbose_diag ? 1 : 0);
 	PS4ProbeLogger::LogStatus();
@@ -1833,8 +2298,15 @@ int main()
 		fsync(s_log);
 		close(s_log);
 	}
-	if (s_game_session)
-		UsbLog::Final();
+	const std::string final_summary = s_game_session ? UsbLog::Final() : std::string();
+	// Preserve this run immediately, even if the next launch never happens or the USB was absent.
+	const auto final_archive = PS4SessionLogs::ArchivePrevious(final_summary.c_str());
+	if (final_archive.error)
+		std::fprintf(stderr, "Session archive failed: directory=%s errno=%d; root logs and marker retained\n",
+			final_archive.directory, final_archive.error);
+	else if (s_game_session && !UsbLog::SyncFinalMetadata(final_archive.directory))
+		std::fprintf(stderr, "Session archive: final session metadata remains in internal archive %s\n",
+			final_archive.directory);
 	if (relaunch_main_menu)
 	{
 		// VM teardown closes Vulkan/VideoOut resources. Reinitializing them in the

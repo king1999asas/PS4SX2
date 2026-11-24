@@ -251,8 +251,11 @@ void Host::LoadSettings(SettingsInterface& si, std::unique_lock<std::mutex>&)
 	// No persistent settings storage on PS4; use defaults.
 }
 
-// Defined in main.cpp: per-session averages for the USB log summary.
-void PS4SessionStatsAdd(double speed, double fps, double ee, double gs, double vu1, double gpu);
+// Defined in main.cpp: raw per-session performance samples for the CSV archive.
+void PS4SessionStatsAdd(double ps2_hz, double speed, double fps, double frame_ms, double frame_max_ms,
+	                   double ee, double ee_ms, double gs, double gs_ms, double vu1, double vu1_ms,
+	                   double gpu, double gpu_ms);
+bool PS4SessionStatsDetailedSamplingRequested();
 
 void Host::OnPerformanceMetricsUpdated()
 {
@@ -261,7 +264,8 @@ void Host::OnPerformanceMetricsUpdated()
 	static Common::Timer::Value first_update = Common::Timer::GetCurrentValue();
 	static Common::Timer::Value last_log = 0;
 	const auto now = Common::Timer::GetCurrentValue();
-	if (last_log != 0 && Common::Timer::ConvertValueToSeconds(now - last_log) < 5.0)
+	const double sampling_interval = PS4SessionStatsDetailedSamplingRequested() ? 1.0 : 5.0;
+	if (last_log != 0 && Common::Timer::ConvertValueToSeconds(now - last_log) < sampling_interval)
 		return;
 	const double profile_interval = last_log ? Common::Timer::ConvertValueToSeconds(now - last_log) : 0.0;
 	last_log = now;
@@ -283,8 +287,10 @@ void Host::OnPerformanceMetricsUpdated()
 		(ee_usage + gs_usage + vu_usage > 0.0) ? "samples" : "no_samples",
 		PerformanceMetrics::GetGPUUsage(), gpu_ms, gpu_ms > 0.0f ? "samples" : "no_samples");
 	if (profile_interval > 0.0)
-		PS4SessionStatsAdd(PerformanceMetrics::GetSpeed(), PerformanceMetrics::GetInternalFPS(), ee_usage, gs_usage,
-			vu_usage, PerformanceMetrics::GetGPUUsage());
+		PS4SessionStatsAdd(PerformanceMetrics::GetFPS(), PerformanceMetrics::GetSpeed(), PerformanceMetrics::GetInternalFPS(),
+			PerformanceMetrics::GetAverageFrameTime(), PerformanceMetrics::GetMaximumFrameTime(),
+			ee_usage, PerformanceMetrics::GetCPUThreadAverageTime(), gs_usage, PerformanceMetrics::GetGSThreadAverageTime(),
+			vu_usage, PerformanceMetrics::GetVUThreadAverageTime(), PerformanceMetrics::GetGPUUsage(), gpu_ms);
 	PS4IPUProfile::LogInterval(profile_interval);
 	PS4EEEventProfile::LogInterval(profile_interval);
 	PS4GSProfile::LogInterval(profile_interval);
