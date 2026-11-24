@@ -1617,11 +1617,13 @@ static void* RunVM(void*)
 		ProbeLog("EE hotspots: %s; event and IPU-call frequencies, not CPU-time shares (disable with /data/PS4SX2/vm-no-ee-hotspots)\n",
 			PS4EEHotspots::enabled ? "enabled" : "disabled");
 #if defined(PCSX2_PS4_VM_EE_BLOCK_PROFILE)
-		PS4EEHotspots::ResetBlockSampling(true);
-		ProbeLog("EE JIT block sampling: enabled by diagnostic build; randomized interval 2048-4095 block entries\n");
+		const bool block_profile_requested = hotspot_marker || s_verbose_diag;
+		PS4EEHotspots::ResetBlockSampling(block_profile_requested);
+		ProbeLog("EE JIT block sampling: %s (diagnostic build; randomized interval 2048-4095 block entries)\n",
+			block_profile_requested ? "enabled by marker" : "disabled for performance");
 #else
-		PS4EEHotspots::ResetBlockSampling(hotspot_marker || s_verbose_diag);
-		ProbeLog("EE JIT block sampling: %s\n", (hotspot_marker || s_verbose_diag) ? "enabled (verbose forces on)" : "disabled in performance build");
+		PS4EEHotspots::ResetBlockSampling(false);
+		ProbeLog("EE JIT block sampling: unavailable (build without PCSX2_VM_EE_BLOCK_PROFILE)\n");
 #endif
 		PS4EEEventProfile::s_sampling = {};
 		// (AI-assisted) Keep deep profiling opt-in: PS1 can reach over a million

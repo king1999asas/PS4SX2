@@ -5,13 +5,14 @@ param(
   [ValidateRange(1, 16)][int]$Jobs = 4,
   [ValidateSet('OFF', 'ON')][string]$Jit = 'ON',
   [ValidateSet('OFF', 'ON')][string]$Fastmem = 'ON',
-  [ValidateSet('OFF', 'ON')][string]$MTVU = 'ON'
+  [ValidateSet('OFF', 'ON')][string]$MTVU = 'ON',
+  [ValidateSet('OFF', 'ON')][string]$EEBlockProfile = 'OFF'
 )
 $ErrorActionPreference = 'Stop'
-Write-Output "(AI-assisted) VM build: JIT=$Jit Fastmem=$Fastmem MTVU=$MTVU"
+Write-Output "(AI-assisted) VM build: JIT=$Jit Fastmem=$Fastmem MTVU=$MTVU EEBlockProfile=$EEBlockProfile"
 $scriptPath = (& wsl.exe -d $Distro -- wslpath -a ($PSScriptRoot.Replace('\', '/') + '/build-wsl.sh')).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Could not resolve WSL script path.' }
-& wsl.exe -d $Distro -- env "PCSX2_VM_JIT=$Jit" "PCSX2_VM_FASTMEM=$Fastmem" "PCSX2_VM_MTVU=$MTVU" bash $scriptPath $Jobs
+& wsl.exe -d $Distro -- env "PCSX2_VM_JIT=$Jit" "PCSX2_VM_FASTMEM=$Fastmem" "PCSX2_VM_MTVU=$MTVU" "PCSX2_VM_EE_BLOCK_PROFILE=$EEBlockProfile" bash $scriptPath $Jobs
 if ($LASTEXITCODE -ne 0) { throw 'VM build failed; no package published.' }
 $elfPath = Join-Path $PSScriptRoot 'build/vm_boot'
 $stamp = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($elfPath))
