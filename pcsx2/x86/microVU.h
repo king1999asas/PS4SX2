@@ -21,6 +21,9 @@
 #include "microVU_IR.h"
 #include "microVU_Profiler.h"
 #include "common/Perf.h"
+#if defined(PCSX2_PS4_VM_BOOT)
+#include "ps4/core/EEHotspotsPS4.h"
+#endif
 
 class microBlockManager;
 
@@ -121,6 +124,15 @@ struct microVU
 	u32 q;            // Holds current Q instance index
 	u32 totalCycles;  // Total Cycles that mVU is expected to run for
 	s32 cycles;       // Cycles Counter
+#if defined(PCSX2_PS4_VM_BOOT)
+	// VU1-only profiling of guest cycles between dynamic JR/JALR dispatches. Written on the MTVU thread.
+	bool orbisVU1MicroProfileEnabled = false;
+	u32 orbisVU1LastPC = 0, orbisVU1LastUsedCycles = 0;
+	u16 orbisVU1TouchedCount = 0;
+	u16 orbisVU1TouchedPCs[0x4000 / 8]{};
+	u64 orbisVU1SegmentsByPC[0x4000 / 8]{};
+	u64 orbisVU1CyclesByPC[0x4000 / 8]{};
+#endif
 	u32 compileDepth; // PS5 port: mVUcompile nesting; the outermost one sets and saves the emitter pointers
 #ifdef ORBIS_VULKAN
 	// PS5 port (vk-285-11): mVUexecute's recent program/block lookups (microVU_Execute.inl). A lookup

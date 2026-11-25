@@ -327,6 +327,18 @@ _mVUt void* mVUexecute(u32 startPC, u32 cycles)
 
 	mVU.cycles = cycles;
 	mVU.totalCycles = cycles;
+	if constexpr (vuIndex == 1)
+	{
+#if defined(PCSX2_PS4_VM_BOOT)
+		mVU.orbisVU1MicroProfileEnabled = PS4EEHotspots::VU1ProgramProfileEnabled();
+		if (mVU.orbisVU1MicroProfileEnabled)
+		{
+			mVU.orbisVU1LastPC = startPC & vuLimit;
+			mVU.orbisVU1LastUsedCycles = 0;
+			mVU.orbisVU1TouchedCount = 0;
+		}
+#endif
+	}
 
 #ifndef ORBIS_VULKAN // PS5 port: mVUcompile sets the emitter pointers when it emits (microVU_Compile.inl)
 	xSetTextPtr(mVU.textPtr());
@@ -373,6 +385,25 @@ _mVUt void* mVUexecute(u32 startPC, u32 cycles)
 _mVUt void mVUcleanUp()
 {
 	microVU& mVU = mVUx;
+	if constexpr (vuIndex == 1)
+	{
+#if defined(PCSX2_PS4_VM_BOOT)
+		if (mVU.orbisVU1MicroProfileEnabled)
+		{
+			const u32 used_cycles = mVUorbisVU1CyclesUsed(mVU);
+			mVUorbisVU1AccumulateSegment(mVU, used_cycles);
+			PS4EEHotspots::RecordVU1MicroProfile(mVU.orbisVU1TouchedPCs, mVU.orbisVU1SegmentsByPC,
+				mVU.orbisVU1CyclesByPC, mVU.orbisVU1TouchedCount);
+			for (u32 i = 0; i < mVU.orbisVU1TouchedCount; ++i)
+			{
+				const u32 pc_index = mVU.orbisVU1TouchedPCs[i];
+				mVU.orbisVU1SegmentsByPC[pc_index] = 0;
+				mVU.orbisVU1CyclesByPC[pc_index] = 0;
+			}
+			mVU.orbisVU1TouchedCount = 0;
+		}
+#endif
+	}
 
 #ifdef ORBIS_VULKAN // PS5 port: mVUcompile saved the end of the emitted code in mVU.prog.x86ptr
 	if ((mVU.prog.x86ptr < mVU.prog.x86start) || (mVU.prog.x86ptr >= mVU.prog.x86end))

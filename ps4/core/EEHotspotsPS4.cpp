@@ -23,10 +23,16 @@ namespace PS4EEHotspots
 			u64 cycles = 0;
 			u64 instruction = 0;
 		};
+		struct VU1MicroEntry
+		{
+			u64 segments = 0;
+			u64 cycles = 0;
+		};
 		constexpr u32 VU1ProgramCount = 0x4000 / 8;
 		struct VU1ProgramBuffer
 		{
 			std::array<VU1ProgramEntry, VU1ProgramCount> entries{};
+			std::array<VU1MicroEntry, VU1ProgramCount> micro_entries{};
 		};
 		std::array<VU1ProgramBuffer, 2> s_vu1_program_buffers{};
 		std::atomic<u32> s_vu1_program_active{0};
@@ -243,9 +249,18 @@ namespace PS4EEHotspots
 				u64 cycles = 0;
 				u64 instruction = 0;
 			};
+			struct RankedMicro
+			{
+				u32 pc = 0;
+				u64 segments = 0;
+				u64 cycles = 0;
+			};
 			std::array<RankedProgram, 12> top{};
+			std::array<RankedMicro, 12> top_micro{};
 			u64 total_runs = 0;
 			u64 total_cycles = 0;
+			u64 total_micro_segments = 0;
+			u64 total_micro_cycles = 0;
 			const u32 active = s_vu1_program_active.load(std::memory_order_relaxed) & 1;
 			const u32 read_buffer = s_vu1_program_active.exchange(active ^ 1, std::memory_order_acq_rel);
 			while (s_vu1_program_writers[read_buffer].load(std::memory_order_acquire) != 0)
@@ -257,19 +272,37 @@ namespace PS4EEHotspots
 				VU1ProgramEntry& entry = entries[i];
 				const u64 runs = entry.runs;
 				const u64 cycles = entry.cycles;
-				if (!runs)
-					continue;
-				total_runs += runs;
-				total_cycles += cycles;
-				RankedProgram candidate{i * 8, runs, cycles, entry.instruction};
-				if (candidate.cycles <= top.back().cycles)
-					continue;
-				top.back() = candidate;
-				std::sort(top.begin(), top.end(), [](const RankedProgram& a, const RankedProgram& b) {
-					return a.cycles > b.cycles;
-				});
+				if (runs)
+				{
+					total_runs += runs;
+					total_cycles += cycles;
+					RankedProgram candidate{i * 8, runs, cycles, entry.instruction};
+					if (candidate.cycles > top.back().cycles)
+					{
+						top.back() = candidate;
+						std::sort(top.begin(), top.end(), [](const RankedProgram& a, const RankedProgram& b) {
+							return a.cycles > b.cycles;
+						});
+					}
+				}
+
+				const VU1MicroEntry& micro = s_vu1_program_buffers[read_buffer].micro_entries[i];
+				if (micro.segments)
+				{
+					total_micro_segments += micro.segments;
+					total_micro_cycles += micro.cycles;
+					RankedMicro micro_candidate{i * 8, micro.segments, micro.cycles};
+					if (micro_candidate.cycles > top_micro.back().cycles)
+					{
+						top_micro.back() = micro_candidate;
+						std::sort(top_micro.begin(), top_micro.end(), [](const RankedMicro& a, const RankedMicro& b) {
+							return a.cycles > b.cycles;
+						});
+					}
+				}
 			}
 			entries = {};
+			s_vu1_program_buffers[read_buffer].micro_entries = {};
 			ProbeLog("VU1 program profile: seconds=%.2f runs=%llu cycles=%llu metric=exact_guest_cycles_by_entry_pc dropped=0\n",
 				seconds, static_cast<unsigned long long>(total_runs), static_cast<unsigned long long>(total_cycles));
 			for (const RankedProgram& program : top)
@@ -281,6 +314,19 @@ namespace PS4EEHotspots
 					100.0 * static_cast<double>(program.cycles) / std::max<u64>(1, total_cycles),
 					static_cast<unsigned long long>(program.cycles / program.runs),
 					static_cast<unsigned long long>(program.instruction));
+			}
+			ProbeLog("VU1 microcode segment profile: seconds=%.2f segments=%llu cycles=%llu metric=exact_guest_cycles_between_dynamic_JR_JALR_dispatches\n",
+				seconds, static_cast<unsigned long long>(total_micro_segments),
+				static_cast<unsigned long long>(total_micro_cycles));
+			for (const RankedMicro& segment : top_micro)
+			{
+				if (!segment.segments)
+					break;
+				ProbeLog("VU1 microcode work item: pc=%04x segments=%llu cycles=%llu cycle_share_pct=%.2f avg_cycles=%llu\n",
+					segment.pc, static_cast<unsigned long long>(segment.segments),
+					static_cast<unsigned long long>(segment.cycles),
+					100.0 * static_cast<double>(segment.cycles) / std::max<u64>(1, total_micro_cycles),
+					static_cast<unsigned long long>(segment.cycles / segment.segments));
 			}
 		}
 	} // namespace
@@ -351,6 +397,7 @@ namespace PS4EEHotspots
 		for (VU1ProgramBuffer& buffer : s_vu1_program_buffers)
 		{
 			buffer.entries = {};
+			buffer.micro_entries = {};
 		}
 		s_vu1_program_profile_enabled.store(enable, std::memory_order_relaxed);
 	}
@@ -372,6 +419,39 @@ namespace PS4EEHotspots
 			++entry.runs;
 			entry.cycles += cycles;
 			entry.instruction = instruction;
+			s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
+			return;
+		}
+	}
+
+	bool VU1ProgramProfileEnabled()
+	{
+		return s_vu1_program_profile_enabled.load(std::memory_order_relaxed);
+	}
+
+	void RecordVU1MicroProfile(const u16* pc_indices, const u64* segments_by_pc, const u64* cycles_by_pc,
+		u32 touched_count)
+	{
+		if (!s_vu1_program_profile_enabled.load(std::memory_order_relaxed) || !touched_count)
+			return;
+		for (;;)
+		{
+			const u32 buffer_index = s_vu1_program_active.load(std::memory_order_acquire) & 1;
+			s_vu1_program_writers[buffer_index].fetch_add(1, std::memory_order_acquire);
+			if (buffer_index != (s_vu1_program_active.load(std::memory_order_acquire) & 1))
+			{
+				s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
+				continue;
+			}
+			for (u32 i = 0; i < touched_count; ++i)
+			{
+				const u32 pc_index = pc_indices[i];
+				if (pc_index >= VU1ProgramCount)
+					continue;
+				VU1MicroEntry& entry = s_vu1_program_buffers[buffer_index].micro_entries[pc_index];
+				entry.segments += segments_by_pc[pc_index];
+				entry.cycles += cycles_by_pc[pc_index];
+			}
 			s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
 			return;
 		}

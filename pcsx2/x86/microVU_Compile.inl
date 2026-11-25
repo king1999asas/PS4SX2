@@ -1080,8 +1080,41 @@ __fi void* mVUblockFetch(microVU& mVU, u32 startPC, uptr pState)
 }
 
 // mVUcompileJIT() - Called By JR/JALR during execution
+#if defined(PCSX2_PS4_VM_BOOT)
+static __fi u32 mVUorbisVU1CyclesUsed(const microVU& mVU)
+{
+	return mVU.totalCycles - std::min(mVU.totalCycles, static_cast<u32>(std::max<s32>(0, mVU.cycles)));
+}
+
+static __fi void mVUorbisVU1AccumulateSegment(microVU& mVU, u32 usedCycles)
+{
+	if (!mVU.orbisVU1MicroProfileEnabled || usedCycles <= mVU.orbisVU1LastUsedCycles)
+		return;
+	const u32 pc_index = (mVU.orbisVU1LastPC & 0x3ff8) >> 3;
+	if (pc_index < std::size(mVU.orbisVU1SegmentsByPC))
+	{
+		if (mVU.orbisVU1SegmentsByPC[pc_index] == 0 && mVU.orbisVU1CyclesByPC[pc_index] == 0)
+			mVU.orbisVU1TouchedPCs[mVU.orbisVU1TouchedCount++] = static_cast<u16>(pc_index);
+		++mVU.orbisVU1SegmentsByPC[pc_index];
+		mVU.orbisVU1CyclesByPC[pc_index] += usedCycles - mVU.orbisVU1LastUsedCycles;
+	}
+	mVU.orbisVU1LastUsedCycles = usedCycles;
+}
+#endif
+
 _mVUt void* mVUcompileJIT(u32 startPC, uptr ptr)
 {
+	if constexpr (vuIndex == 1)
+	{
+#if defined(PCSX2_PS4_VM_BOOT)
+		microVU& mVU = mVUx;
+		if (mVU.orbisVU1MicroProfileEnabled)
+		{
+			mVUorbisVU1AccumulateSegment(mVU, mVUorbisVU1CyclesUsed(mVU));
+			mVU.orbisVU1LastPC = startPC & 0x3ff8;
+		}
+#endif
+	}
 	if (doJumpAsSameProgram) // Treat jump as part of same microProgram
 	{
 		if (doJumpCaching) // When doJumpCaching, ptr is a microBlock pointer
