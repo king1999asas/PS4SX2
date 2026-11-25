@@ -203,6 +203,22 @@ u8 PadDualshock2::ButtonQuery(u8 commandByte)
 u8 PadDualshock2::Poll(u8 commandByte)
 {
 	const u32 buttons = GetButtons();
+#if defined(PCSX2_PS4)
+	// Observe the state at the guest-facing SIO response, not just at host input.
+	// Emit one line per state change to keep the trace small during long sessions.
+	if (commandBytesReceived == 3)
+	{
+		const auto [left_x, left_y] = GetRawLeftAnalog();
+		if (buttons != m_last_ps4_trace_buttons || left_x != m_last_ps4_trace_lx || left_y != m_last_ps4_trace_ly)
+		{
+			Console.WriteLnFmt("[padtrace] guest SIO poll slot={} mode={} buttons(active-low)={:08X} left={},{}, response3={:02X} response4={:02X}",
+				unifiedSlot, static_cast<u32>(currentMode), buttons, left_x, left_y, (buttons >> 8) & 0xff, buttons & 0xff);
+			m_last_ps4_trace_buttons = buttons;
+			m_last_ps4_trace_lx = left_x;
+			m_last_ps4_trace_ly = left_y;
+		}
+	}
+	#endif
 	u8 largeMotor = 0x00;
 	u8 smallMotor = 0x00;
 

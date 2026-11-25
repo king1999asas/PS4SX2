@@ -69,6 +69,11 @@ private:
 	bool analogPressed = false;
 	bool commandStage = false;
 	u32 responseBytes = 0;
+#if defined(PCSX2_PS4)
+	u32 m_last_ps4_trace_buttons = ~u32{0};
+	u8 m_last_ps4_trace_lx = 0xff;
+	u8 m_last_ps4_trace_ly = 0xff;
+#endif
 	std::array<u8, VIBRATION_MOTORS> vibrationMotors = {};
 	float axisScale = 1.0f;
 	float axisDeadzone = 0.0f;
