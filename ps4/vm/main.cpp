@@ -1628,16 +1628,21 @@ namespace BeeCarMute
 	enum class AuditState : u8
 	{
 		NotRead,
+		Matched,
 		Applied,
 		WrongTag,
 		WrongVolume,
 	};
 	static std::atomic<u8> s_audit[std::size(Fixes)]{};
+	static std::atomic<u32> s_matched{0};
+	static std::atomic<u32> s_unique_matched{0};
 	static std::atomic<u32> s_applied{0};
 	static std::atomic<u32> s_unique_applied{0};
 
 	static void ResetAudit()
 	{
+		s_matched.store(0, std::memory_order_relaxed);
+		s_unique_matched.store(0, std::memory_order_relaxed);
 		s_applied.store(0, std::memory_order_relaxed);
 		s_unique_applied.store(0, std::memory_order_relaxed);
 		for (std::atomic<u8>& state : s_audit)
@@ -1650,7 +1655,7 @@ namespace BeeCarMute
 		s_audit[index].compare_exchange_strong(expected, static_cast<u8>(state), std::memory_order_relaxed);
 	}
 
-	static void Hook(u8* buffer, u32 lsn)
+	static void Hook(u8* buffer, u32 lsn, bool mute)
 	{
 		const u64 begin = static_cast<u64>(lsn) * 2048;
 		const u64 end = begin + 2048;
@@ -1676,13 +1681,25 @@ namespace BeeCarMute
 				RecordMismatch(index, AuditState::WrongVolume);
 				continue;
 			}
-			std::memcpy(buffer + pos, &Silent, sizeof(Silent));
-			const u32 count = s_applied.fetch_add(1, std::memory_order_relaxed) + 1;
-			const u8 prior = s_audit[index].exchange(static_cast<u8>(AuditState::Applied), std::memory_order_relaxed);
-			if (prior != static_cast<u8>(AuditState::Applied))
-				s_unique_applied.fetch_add(1, std::memory_order_relaxed);
-			if (count <= 128)
-				ProbeLog("Bee Movie: car sound muted: %s (disc offset %u, applied %u)\n", fix->name, fix->offset, count);
+			const AuditState result = mute ? AuditState::Applied : AuditState::Matched;
+			const u8 prior = s_audit[index].exchange(static_cast<u8>(result), std::memory_order_relaxed);
+			if (prior != static_cast<u8>(AuditState::Matched) && prior != static_cast<u8>(AuditState::Applied))
+				s_unique_matched.fetch_add(1, std::memory_order_relaxed);
+			const u32 matches = s_matched.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (mute)
+			{
+				std::memcpy(buffer + pos, &Silent, sizeof(Silent));
+				const u32 mutations = s_applied.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (prior != static_cast<u8>(AuditState::Applied))
+					s_unique_applied.fetch_add(1, std::memory_order_relaxed);
+				if (mutations <= 128)
+					ProbeLog("Bee Movie: car sound muted: %s (disc offset %u, applied %u)\n", fix->name, fix->offset, mutations);
+			}
+			else if (matches <= 128)
+			{
+				ProbeLog("Bee Movie: car sound verified (read-only): %s (disc offset %u, match %u)\n",
+					fix->name, fix->offset, matches);
+			}
 		}
 	}
 
@@ -1699,13 +1716,14 @@ namespace BeeCarMute
 				case AuditState::Applied: break;
 			}
 		}
-		ProbeLog("Bee Movie: car sound audit candidates=%zu uniquely_muted=%u mutations=%u not_read=%u wrong_tag=%u wrong_volume=%u\n",
-			std::size(Fixes), s_unique_applied.load(std::memory_order_relaxed),
+		ProbeLog("Bee Movie: car sound audit candidates=%zu unique_verified=%u matches=%u uniquely_muted=%u mutations=%u not_read=%u wrong_tag=%u wrong_volume=%u\n",
+			std::size(Fixes), s_unique_matched.load(std::memory_order_relaxed),
+			s_matched.load(std::memory_order_relaxed), s_unique_applied.load(std::memory_order_relaxed),
 			s_applied.load(std::memory_order_relaxed), not_read, wrong_tag, wrong_volume);
 		for (size_t i = 0; i < std::size(Fixes); ++i)
 		{
 			const AuditState state = static_cast<AuditState>(s_audit[i].load(std::memory_order_relaxed));
-			if (state == AuditState::Applied)
+			if (state == AuditState::Matched || state == AuditState::Applied)
 				continue;
 			const char* result = state == AuditState::NotRead ? "not read" :
 			                     state == AuditState::WrongTag ? "tag mismatch" : "volume mismatch";
@@ -1719,6 +1737,7 @@ namespace BeeCarMute
 // level loads, streamed videos and audio next to the performance lines.
 namespace DiscReadLog
 {
+	static bool s_bee_car_sound_audit = false;
 	static bool s_bee_car_mute = false;
 	static u32 s_first = 0, s_next = 0, s_sectors = 0;
 
@@ -1736,14 +1755,14 @@ namespace DiscReadLog
 		{
 			// Repeated reads of the same sector (retries, buffered re-reads) do not split a run.
 			if (s_sectors != 0 && lsn == s_next - 1)
-				return s_bee_car_mute ? BeeCarMute::Hook(buffer, lsn) : void();
+				return s_bee_car_sound_audit ? BeeCarMute::Hook(buffer, lsn, s_bee_car_mute) : void();
 			Flush();
 			s_first = lsn;
 		}
 		s_next = lsn + 1;
 		++s_sectors;
-		if (s_bee_car_mute)
-			BeeCarMute::Hook(buffer, lsn);
+		if (s_bee_car_sound_audit)
+			BeeCarMute::Hook(buffer, lsn, s_bee_car_mute);
 	}
 } // namespace DiscReadLog
 
@@ -1825,10 +1844,12 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 			std::fclose(file);
 		game_serial = serial;
 	}
-	const bool bee_car_mute = game_serial == BeeCarMute::Serial &&
+	const bool bee_car_sound_audit = game_serial == BeeCarMute::Serial;
+	const bool bee_car_mute = bee_car_sound_audit &&
 		std::find(enabled_patches.begin(), enabled_patches.end(), BeeCarMute::PatchName) != enabled_patches.end();
-	if (bee_car_mute)
+	if (bee_car_sound_audit)
 		BeeCarMute::ResetAudit();
+	DiscReadLog::s_bee_car_sound_audit = bee_car_sound_audit;
 	DiscReadLog::s_bee_car_mute = bee_car_mute;
 	g_ps4_disc_read_hook = DiscReadLog::Hook;
 	settings->SetBoolValue("EmuCore", "EnableCheats", !enabled_cheats.empty());
@@ -1853,9 +1874,9 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 		ProbeLog("Launcher cheat enabled: %s\n", name.c_str());
 	for (const std::string& name : enabled_patches)
 		ProbeLog("Launcher patch enabled: %s\n", name.c_str());
-	if (bee_car_mute)
-		ProbeLog("Bee Movie: car sound audit armed (%zu candidate records; confirmed outcomes logged at shutdown)\n",
-			std::size(BeeCarMute::Fixes));
+	if (bee_car_sound_audit)
+		ProbeLog("Bee Movie: car sound audit armed (%zu candidate records; %s; confirmed outcomes logged at shutdown)\n",
+			std::size(BeeCarMute::Fixes), bee_car_mute ? "mute patch enabled" : "read-only; no audio data changed");
 	SessionSummary::SetSettings(ee_cycle_rate, ee_cycle_skip, fast_cdvd, fast_boot, audio_enabled, download_mode,
 		minimum_blending, fast_math, enabled_patches, enabled_cheats);
 }
@@ -2229,7 +2250,7 @@ static void* RunVM(void*)
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 		OrbisVU1DumpWait();
 #endif
-		if (DiscReadLog::s_bee_car_mute)
+		if (DiscReadLog::s_bee_car_sound_audit)
 			BeeCarMute::LogAudit();
 	}
 	else
