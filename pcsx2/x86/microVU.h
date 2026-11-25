@@ -134,10 +134,9 @@ struct microVU
 	u64 orbisVU1CyclesByPC[0x4000 / 8]{};
 #endif
 	u32 compileDepth; // PS5 port: mVUcompile nesting; the outermost one sets and saves the emitter pointers
-#ifdef ORBIS_VULKAN
-	// PS5 port (vk-285-11): mVUexecute's recent program/block lookups (microVU_Execute.inl). A lookup
-	// walks the quick table, the program's block array and the block manager's variants: cold cache
-	// lines on a console whose memory latency is high, ~9% of the EE thread at a fight's peak.
+#if defined(ORBIS_VULKAN) || defined(PCSX2_PS4_VM_BOOT)
+	// Recent mVUexecute program/block lookups. The key includes PC, program start and quick pipeline state;
+	// exact-match states still use mVUsearchProg. Every compile, clear, reset and close invalidates it.
 	struct EntryCacheSlot
 	{
 		u64 quick;          // lpState.quick64[0] it was looked up with (needExactMatch == 0)
@@ -313,7 +312,7 @@ public:
 };
 
 // microVU rec structs
-#ifdef ORBIS_VULKAN // PS5 port: the entry cache is cache-line aligned (vk-285-11)
+#if defined(ORBIS_VULKAN) || defined(PCSX2_PS4_VM_BOOT)
 alignas(64) microVU microVU0;
 alignas(64) microVU microVU1;
 #else

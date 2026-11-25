@@ -1037,6 +1037,9 @@ perf_and_return:
 // testing beyond the PS5 build.
 void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 {
+#if defined(PCSX2_PS4_VM_BOOT) && !defined(ORBIS_VULKAN)
+	++mVU.entryCacheGeneration;
+#endif
 #if defined(PCSX2_PS4_VM_BOOT)
 	const bool profile_vu1_compile = mVU.index == 1 && PS4EEHotspots::VU1ProgramProfileEnabled();
 	const auto compile_started = profile_vu1_compile ? std::chrono::steady_clock::now() :

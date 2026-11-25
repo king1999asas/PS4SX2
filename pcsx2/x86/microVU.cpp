@@ -63,8 +63,8 @@ void mVUreset(microVU& mVU, bool resetReserve)
 
 	mVU.regs().nextBlockCycles = 0;
 	memset(&mVU.prog.lpState, 0, sizeof(mVU.prog.lpState));
-#ifdef ORBIS_VULKAN
-	mVU.entryCacheGeneration++; // PS5 port (vk-285-11): mVUexecute's lookup cache
+#if defined(ORBIS_VULKAN) || defined(PCSX2_PS4_VM_BOOT)
+	mVU.entryCacheGeneration++;
 #endif
 	mVU.profiler.Reset(mVU.index);
 
@@ -99,8 +99,8 @@ void mVUreset(microVU& mVU, bool resetReserve)
 // Free Allocated Resources
 void mVUclose(microVU& mVU)
 {
-#ifdef ORBIS_VULKAN
-	mVU.entryCacheGeneration++; // PS5 port (vk-285-11): mVUexecute's lookup cache
+#if defined(ORBIS_VULKAN) || defined(PCSX2_PS4_VM_BOOT)
+	mVU.entryCacheGeneration++;
 #endif
 	// Delete Programs and Block Managers
 	for (u32 i = 0; i < (mVU.progSize / 2); i++)
@@ -118,8 +118,8 @@ void mVUclose(microVU& mVU)
 // Clears Block Data in specified range
 __fi void mVUclear(mV, u32 addr, u32 size)
 {
-#ifdef ORBIS_VULKAN
-	mVU.entryCacheGeneration++; // PS5 port (vk-285-11): mVUexecute's lookup cache
+#if defined(ORBIS_VULKAN) || defined(PCSX2_PS4_VM_BOOT)
+	mVU.entryCacheGeneration++;
 #endif
 	if (!mVU.prog.cleared)
 	{

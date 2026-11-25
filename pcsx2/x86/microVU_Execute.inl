@@ -340,15 +340,13 @@ _mVUt void* mVUexecute(u32 startPC, u32 cycles)
 #endif
 	}
 
-#ifndef ORBIS_VULKAN // PS5 port: mVUcompile sets the emitter pointers when it emits (microVU_Compile.inl)
+#ifndef ORBIS_VULKAN // mVUcompile sets the emitter pointers when it emits (microVU_Compile.inl)
 	xSetTextPtr(mVU.textPtr());
 	xSetPtr(mVU.prog.x86ptr); // Set x86ptr to where last program left off
-#else
-	// PS5 port (vk-285-11): a repeat of a recent lookup with the same program, entry PC and pipeline
-	// state returns what mVUsearchProg returned then, with the same side effects (isSame, cur; the
-	// quick table's block field is only scratch inside mVUsearchProg). Every compile, clear, reset and
-	// close bumps the generation, so a slot never outlives a change that could alter the answer.
-	// Exact-match states always search. Needs proper testing.
+#endif
+#if defined(ORBIS_VULKAN) || defined(PCSX2_PS4_VM_BOOT)
+	// Reuse a recent lookup when the entry PC, program start and quick pipeline state match. Exact-match
+	// states still use mVUsearchProg. Generation bumps invalidate entries after any cache mutation.
 	const microRegInfo& lp = mVU.prog.lpState;
 	if (!lp.needExactMatch)
 	{
