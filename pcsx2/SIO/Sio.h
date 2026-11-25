@@ -38,24 +38,24 @@ struct _mcd
 		return FileMcd_IsPSX(port, slot);
 	}
 
-	void EraseBlock()
+	s32 EraseBlock()
 	{
 		//DevCon.WriteLn("Memcard Erase (sectorAddr = %08X)", sectorAddr);
-		FileMcd_EraseBlock(port, slot, transferAddr);
+		return FileMcd_EraseBlock(port, slot, transferAddr);
 	}
 
 	// Read from memorycard to dest
-	void Read(u8 *dest, int size)
+	s32 Read(u8 *dest, int size)
 	{
 		//DevCon.WriteLn("Memcard Read (sectorAddr = %08X)", sectorAddr);
-		FileMcd_Read(port, slot, dest, transferAddr, size);
+		return FileMcd_Read(port, slot, dest, transferAddr, size);
 	}
 
 	// Write to memorycard from src
-	void Write(u8 *src, int size)
+	s32 Write(u8 *src, int size)
 	{
 		//DevCon.WriteLn("Memcard Write (sectorAddr = %08X)", sectorAddr);
-		FileMcd_Save(port, slot, src,transferAddr, size);
+		return FileMcd_Save(port, slot, src, transferAddr, size);
 	}
 
 	bool IsPresent()

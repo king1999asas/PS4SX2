@@ -225,7 +225,11 @@ void MemoryCardProtocol::WriteData()
 		g_Sio2FifoOut.push_back(0x00);
 	}
 
-	mcd->Write(buf.data(), buf.size());
+	if (!mcd->Write(buf.data(), static_cast<int>(buf.size())))
+	{
+		Console.Error("[mcd] SIO2 write failed port=%u slot=%u sector=0x%08X address=0x%08X bytes=%zu", mcd->port + 1,
+			mcd->slot + 1, mcd->sectorAddr, mcd->transferAddr, buf.size());
+	}
 	g_Sio2FifoOut.push_back(checksum);
 	g_Sio2FifoOut.push_back(mcd->term);
 
@@ -244,7 +248,11 @@ void MemoryCardProtocol::ReadData()
 	g_Sio2FifoOut.push_back(0x2b);
 	std::vector<u8> buf;
 	buf.resize(readLength);
-	mcd->Read(buf.data(), buf.size());
+	if (!mcd->Read(buf.data(), static_cast<int>(buf.size())))
+	{
+		Console.Error("[mcd] SIO2 read failed port=%u slot=%u sector=0x%08X address=0x%08X bytes=%zu", mcd->port + 1,
+			mcd->slot + 1, mcd->sectorAddr, mcd->transferAddr, buf.size());
+	}
 	u8 checksum = 0x00;
 
 	for (const u8 readByte : buf)
@@ -418,7 +426,11 @@ void MemoryCardProtocol::EraseBlock()
 {
 	MC_LOG.WriteLn("%s", __FUNCTION__);
 	PS1_FAIL();
-	mcd->EraseBlock();
+	if (!mcd->EraseBlock())
+	{
+		Console.Error("[mcd] SIO2 erase failed port=%u slot=%u sector=0x%08X address=0x%08X", mcd->port + 1,
+			mcd->slot + 1, mcd->sectorAddr, mcd->transferAddr);
+	}
 	The2bTerminator(4);
 
 	MemcardBusy::SetBusy();

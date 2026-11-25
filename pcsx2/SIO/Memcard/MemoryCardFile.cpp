@@ -200,6 +200,18 @@ protected:
 	bool m_cache_ok[8] = {};
 	u32 m_idle_seconds[8] = {};
 	u32 m_dirty_seconds[8] = {};
+	struct IoStats
+	{
+		u64 read_calls = 0;
+		u64 read_failures = 0;
+		u64 write_calls = 0;
+		u64 write_failures = 0;
+		u64 erase_calls = 0;
+		u64 erase_failures = 0;
+		u64 flush_calls = 0;
+		u64 flush_failures = 0;
+	};
+	IoStats m_io_stats[8] = {};
 
 public:
 	FileMemoryCard();
@@ -224,7 +236,7 @@ protected:
 	bool Seek(std::FILE* f, u32 adr);
 	bool Create(const char* mcdFile, uint sizeInMB);
 	bool LoadCache(uint slot); // vk-285-31
-	void FlushCache(uint slot, const char* why);
+	bool FlushCache(uint slot, const char* why);
 	void MarkDirty(uint slot, u32 adr, u32 size);
 };
 
@@ -303,6 +315,7 @@ void FileMemoryCard::Open()
 	for (int slot = 0; slot < 8; ++slot)
 	{
 		m_filenames[slot] = {};
+		m_io_stats[slot] = {};
 
 		if (EmuConfig.Mcd[slot].Type != MemoryCardType::File)
 			continue;
@@ -439,11 +452,12 @@ void FileMemoryCard::MarkDirty(uint slot, u32 adr, u32 size)
 }
 
 // Writes the dirty erase blocks back: one seek and one write per run of neighbouring blocks.
-void FileMemoryCard::FlushCache(uint slot, const char* why)
+bool FileMemoryCard::FlushCache(uint slot, const char* why)
 {
 	if (!m_dirty_any[slot] || m_cache[slot].empty() || !m_file[slot])
-		return;
+		return true;
 	OrbisMcdTimer timer;
+	m_io_stats[slot].flush_calls++;
 	const auto c0 = std::chrono::steady_clock::now();
 	std::FILE* f = m_file[slot];
 	std::vector<u8>& dirty = m_dirty[slot];
@@ -460,23 +474,49 @@ void FileMemoryCard::FlushCache(uint slot, const char* why)
 		}
 		size_t e = b;
 		while (e < dirty.size() && dirty[e])
-			dirty[e++] = 0;
+			e++;
 		const size_t off = b * MC2_ERASE_SIZE;
 		const size_t len = std::min(e * MC2_ERASE_SIZE, image.size()) - off;
-		ok = ok && FileSystem::FSeek64(f, static_cast<s64>(off), SEEK_SET) == 0 && std::fwrite(&image[off], len, 1, f) == 1;
+		const bool seek_ok = FileSystem::FSeek64(f, static_cast<s64>(off), SEEK_SET) == 0;
+		const bool write_ok = seek_ok && std::fwrite(&image[off], len, 1, f) == 1;
+		if (!write_ok)
+		{
+			ok = false;
+			std::printf("[mcd] slot %u: writeback failed at offset 0x%zx (%zu bytes), seek=%s\n", slot, off, len,
+				seek_ok ? "ok" : "failed");
+		}
 		blocks += static_cast<u32>(e - b);
 		runs++;
 		bytes += len;
 		b = e;
 	}
-	ok = ok && std::fflush(f) == 0;
-	m_dirty_any[slot] = false;
+	const bool flush_ok = std::fflush(f) == 0;
+	if (!flush_ok)
+	{
+		ok = false;
+		std::printf("[mcd] slot %u: fflush failed during writeback\n", slot);
+	}
+	if (ok)
+	{
+		std::fill(dirty.begin(), dirty.end(), 0);
+		m_dirty_any[slot] = false;
+	}
+	else
+	{
+		// Keep all blocks dirty. Some writes may have reached the file before another failed;
+		// replaying those blocks is safe and avoids losing the only RAM copy of the new data.
+		m_dirty_any[slot] = true;
+		m_idle_seconds[slot] = 0;
+		m_dirty_seconds[slot] = 0;
+		m_io_stats[slot].flush_failures++;
+	}
 	g_orbis_mcd_flush_kib.fetch_add(static_cast<u32>(bytes >> 10), std::memory_order_relaxed);
 	std::printf("[mcd] slot %u: wrote back %u block(s) (%zu KiB) in %u write(s), %.1f ms (%s)%s\n", slot, blocks,
 		bytes >> 10, runs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count(), why,
 		ok ? "" : " -- WRITE FAILED");
 	if (!ok)
 		Host::ReportErrorAsync("Memory Card Write Failed", "Error writing the memory card file.");
+	return ok;
 }
 
 // vk-285-31: once an emulated second (sioNextFrame). The first call after a write sees the second
@@ -501,15 +541,32 @@ void FileMemoryCard::Close()
 			continue;
 
 		// vk-285-31: the RAM image's changes first.
-		FlushCache(slot, "close");
+		const bool cache_flushed = FlushCache(slot, "close");
+		u32 dirty_blocks = 0;
+		for (const u8 dirty : m_dirty[slot])
+			dirty_blocks += dirty != 0;
+		Console.WriteLnFmt("[mcd] slot {} summary: {} size={} formatted={} cached={} reads={} read_failures={} writes={} write_failures={} erases={} erase_failures={} flushes={} flush_failures={} dirty_blocks={}",
+			slot, Path::GetFileName(m_filenames[slot]), m_fileSize[slot], FileMcd_IsMemoryCardFormatted(m_file[slot]),
+			!m_cache[slot].empty(), m_io_stats[slot].read_calls, m_io_stats[slot].read_failures,
+			m_io_stats[slot].write_calls, m_io_stats[slot].write_failures, m_io_stats[slot].erase_calls,
+			m_io_stats[slot].erase_failures, m_io_stats[slot].flush_calls, m_io_stats[slot].flush_failures, dirty_blocks);
+		if (!cache_flushed)
+			Console.Error("[mcd] slot %u: checksum sector left unchanged because dirty data did not flush", slot);
 		m_cache[slot] = {};
 		m_dirty[slot] = {};
 		m_cache_ok[slot] = false;
 		g_orbis_mcd_cached.fetch_and(~(1 << slot), std::memory_order_relaxed);
 
-		// Store checksum
-		if (!m_ispsx[slot] && FileSystem::FSeek64(m_file[slot], m_chkaddr, SEEK_SET) == 0)
-			std::fwrite(&m_chksum[slot], sizeof(m_chksum[slot]), 1, m_file[slot]);
+		// Store checksum only when all changed cache blocks reached the file.
+		if (!m_ispsx[slot] && cache_flushed)
+		{
+			if (FileSystem::FSeek64(m_file[slot], m_chkaddr, SEEK_SET) != 0 ||
+				std::fwrite(&m_chksum[slot], sizeof(m_chksum[slot]), 1, m_file[slot]) != 1 || std::fflush(m_file[slot]) != 0)
+			{
+				Console.Error("[mcd] slot %u: checksum sector write failed", slot);
+			}
+		}
+		m_io_stats[slot] = {};
 
 		std::fclose(m_file[slot]);
 		m_file[slot] = nullptr;
@@ -591,16 +648,32 @@ s32 FileMemoryCard::Read(uint slot, u8* dest, u32 adr, int size)
 	}
 	OrbisMcdTimer timer; // vk-285-31
 	g_orbis_mcd_reads.fetch_add(1, std::memory_order_relaxed);
+	m_io_stats[slot].read_calls++;
 	if (!m_cache[slot].empty())
 	{
 		if (size < 0 || static_cast<size_t>(adr) + static_cast<size_t>(size) > m_cache[slot].size())
+		{
+			m_io_stats[slot].read_failures++;
+			Console.Error("[mcd] slot %u: cached read out of range address=0x%08X size=%d card_size=%zu", slot, adr, size,
+				m_cache[slot].size());
 			return 0;
+		}
 		std::memcpy(dest, &m_cache[slot][adr], size);
 		return 1;
 	}
 	if (!Seek(mcfp, adr))
+	{
+		m_io_stats[slot].read_failures++;
+		Console.Error("[mcd] slot %u: read seek failed address=0x%08X size=%d", slot, adr, size);
 		return 0;
-	return std::fread(dest, size, 1, mcfp) == 1;
+	}
+	if (std::fread(dest, size, 1, mcfp) != 1)
+	{
+		m_io_stats[slot].read_failures++;
+		Console.Error("[mcd] slot %u: file read failed address=0x%08X size=%d", slot, adr, size);
+		return 0;
+	}
+	return 1;
 }
 
 s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
@@ -616,13 +689,19 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 	// vk-285-31: on the RAM image (loaded now if this card waited for its first write).
 	OrbisMcdTimer timer;
 	g_orbis_mcd_writes.fetch_add(1, std::memory_order_relaxed);
+	m_io_stats[slot].write_calls++;
 	if (m_cache[slot].empty() && m_cache_ok[slot])
 		LoadCache(slot);
 	if (!m_cache[slot].empty())
 	{
 		std::vector<u8>& image = m_cache[slot];
 		if (size < 0 || static_cast<size_t>(adr) + static_cast<size_t>(size) > image.size())
+		{
+			m_io_stats[slot].write_failures++;
+			Console.Error("[mcd] slot %u: cached write out of range address=0x%08X size=%d card_size=%zu", slot, adr, size,
+				image.size());
 			return 0;
+		}
 		if (static_cast<int>(m_currentdata.size()) < size)
 			m_currentdata.resize(size);
 		for (int i = 0; i < size; i++)
@@ -652,13 +731,23 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 	else
 	{
 		if (!Seek(mcfp, adr))
+		{
+			m_io_stats[slot].write_failures++;
+			Console.Error("[mcd] slot %u: write readback seek failed address=0x%08X size=%d", slot, adr, size);
 			return 0;
+		}
 		if (static_cast<int>(m_currentdata.size()) < size)
 			m_currentdata.resize(size);
 
 		const size_t read_result = std::fread(m_currentdata.data(), size, 1, mcfp);
 		if (read_result == 0)
+		{
+			m_io_stats[slot].read_failures++;
+			m_io_stats[slot].write_failures++;
+			Console.Error("[mcd] slot %u: read-modify-write read failed address=0x%08X size=%d", slot, adr, size);
 			Host::ReportErrorAsync("Memory Card Read Failed", "Error reading memory card.");
+			return 0;
+		}
 
 		for (int i = 0; i < size; i++)
 		{
@@ -681,7 +770,11 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 	}
 
 	if (!Seek(mcfp, adr))
+	{
+		m_io_stats[slot].write_failures++;
+		Console.Error("[mcd] slot %u: write seek failed address=0x%08X size=%d", slot, adr, size);
 		return 0;
+	}
 
 	if (std::fwrite(m_currentdata.data(), size, 1, mcfp) == 1)
 	{
@@ -699,6 +792,8 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 		return 1;
 	}
 
+	m_io_stats[slot].write_failures++;
+	Console.Error("[mcd] slot %u: file write failed address=0x%08X size=%d", slot, adr, size);
 	return 0;
 }
 
@@ -714,23 +809,38 @@ s32 FileMemoryCard::EraseBlock(uint slot, u32 adr)
 	// vk-285-31: on the RAM image.
 	OrbisMcdTimer timer;
 	g_orbis_mcd_erases.fetch_add(1, std::memory_order_relaxed);
+	m_io_stats[slot].erase_calls++;
 	if (m_cache[slot].empty() && m_cache_ok[slot])
 		LoadCache(slot);
 	if (!m_cache[slot].empty())
 	{
 		if (static_cast<size_t>(adr) + MC2_ERASE_SIZE > m_cache[slot].size())
+		{
+			m_io_stats[slot].erase_failures++;
+			Console.Error("[mcd] slot %u: cached erase out of range address=0x%08X card_size=%zu", slot, adr,
+				m_cache[slot].size());
 			return 0;
+		}
 		std::memset(&m_cache[slot][adr], 0xff, MC2_ERASE_SIZE);
 		MarkDirty(slot, adr, MC2_ERASE_SIZE);
 		return 1;
 	}
 
 	if (!Seek(mcfp, adr))
+	{
+		m_io_stats[slot].erase_failures++;
+		Console.Error("[mcd] slot %u: erase seek failed address=0x%08X", slot, adr);
 		return 0;
+	}
 
 	u8 buf[MC2_ERASE_SIZE];
 	std::memset(buf, 0xff, sizeof(buf));
-	return std::fwrite(buf, sizeof(buf), 1, mcfp) == 1;
+	if (std::fwrite(buf, sizeof(buf), 1, mcfp) == 1)
+		return 1;
+
+	m_io_stats[slot].erase_failures++;
+	Console.Error("[mcd] slot %u: file erase write failed address=0x%08X", slot, adr);
+	return 0;
 }
 
 u64 FileMemoryCard::GetCRC(uint slot)
