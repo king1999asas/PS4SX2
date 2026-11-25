@@ -27,6 +27,9 @@ namespace PS4EEHotspots
 		{
 			u64 segments = 0;
 			u64 cycles = 0;
+			u64 compile_blocks = 0;
+			u64 compile_ns = 0;
+			u64 compile_max_ns = 0;
 		};
 		constexpr u32 VU1ProgramCount = 0x4000 / 8;
 		struct VU1ProgramBuffer
@@ -255,12 +258,23 @@ namespace PS4EEHotspots
 				u64 segments = 0;
 				u64 cycles = 0;
 			};
+			struct RankedCompile
+			{
+				u32 pc = 0;
+				u64 blocks = 0;
+				u64 elapsed_ns = 0;
+				u64 max_ns = 0;
+			};
 			std::array<RankedProgram, 12> top{};
 			std::array<RankedMicro, 12> top_micro{};
+			std::array<RankedCompile, 12> top_compile{};
 			u64 total_runs = 0;
 			u64 total_cycles = 0;
 			u64 total_micro_segments = 0;
 			u64 total_micro_cycles = 0;
+			u64 total_compile_blocks = 0;
+			u64 total_compile_ns = 0;
+			u64 max_compile_ns = 0;
 			const u32 active = s_vu1_program_active.load(std::memory_order_relaxed) & 1;
 			const u32 read_buffer = s_vu1_program_active.exchange(active ^ 1, std::memory_order_acq_rel);
 			while (s_vu1_program_writers[read_buffer].load(std::memory_order_acquire) != 0)
@@ -300,6 +314,20 @@ namespace PS4EEHotspots
 						});
 					}
 				}
+				if (micro.compile_blocks)
+				{
+					total_compile_blocks += micro.compile_blocks;
+					total_compile_ns += micro.compile_ns;
+					max_compile_ns = std::max(max_compile_ns, micro.compile_max_ns);
+					RankedCompile compile_candidate{i * 8, micro.compile_blocks, micro.compile_ns, micro.compile_max_ns};
+					if (compile_candidate.elapsed_ns > top_compile.back().elapsed_ns)
+					{
+						top_compile.back() = compile_candidate;
+						std::sort(top_compile.begin(), top_compile.end(), [](const RankedCompile& a, const RankedCompile& b) {
+							return a.elapsed_ns > b.elapsed_ns;
+						});
+					}
+				}
 			}
 			entries = {};
 			s_vu1_program_buffers[read_buffer].micro_entries = {};
@@ -327,6 +355,20 @@ namespace PS4EEHotspots
 					static_cast<unsigned long long>(segment.cycles),
 					100.0 * static_cast<double>(segment.cycles) / std::max<u64>(1, total_micro_cycles),
 					static_cast<unsigned long long>(segment.cycles / segment.segments));
+			}
+			ProbeLog("VU1 microcode compile profile: seconds=%.2f blocks=%llu total_ms=%.3f max_ms=%.3f metric=host_wall_time_on_compile_miss\n",
+				seconds, static_cast<unsigned long long>(total_compile_blocks),
+				static_cast<double>(total_compile_ns) / 1000000.0,
+				static_cast<double>(max_compile_ns) / 1000000.0);
+			for (const RankedCompile& compile : top_compile)
+			{
+				if (!compile.blocks)
+					break;
+				ProbeLog("VU1 microcode compile item: pc=%04x blocks=%llu total_ms=%.3f max_ms=%.3f avg_us=%.2f\n",
+					compile.pc, static_cast<unsigned long long>(compile.blocks),
+					static_cast<double>(compile.elapsed_ns) / 1000000.0,
+					static_cast<double>(compile.max_ns) / 1000000.0,
+					static_cast<double>(compile.elapsed_ns) / static_cast<double>(compile.blocks) / 1000.0);
 			}
 		}
 	} // namespace
@@ -452,6 +494,31 @@ namespace PS4EEHotspots
 				entry.segments += segments_by_pc[pc_index];
 				entry.cycles += cycles_by_pc[pc_index];
 			}
+			s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
+			return;
+		}
+	}
+
+	void RecordVU1Compile(u32 pc, u64 elapsed_ns)
+	{
+		if (!s_vu1_program_profile_enabled.load(std::memory_order_relaxed) || elapsed_ns == 0)
+			return;
+		const u32 pc_index = (pc & 0x3ff8) >> 3;
+		if (pc_index >= VU1ProgramCount)
+			return;
+		for (;;)
+		{
+			const u32 buffer_index = s_vu1_program_active.load(std::memory_order_acquire) & 1;
+			s_vu1_program_writers[buffer_index].fetch_add(1, std::memory_order_acquire);
+			if (buffer_index != (s_vu1_program_active.load(std::memory_order_acquire) & 1))
+			{
+				s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
+				continue;
+			}
+			VU1MicroEntry& entry = s_vu1_program_buffers[buffer_index].micro_entries[pc_index];
+			++entry.compile_blocks;
+			entry.compile_ns += elapsed_ns;
+			entry.compile_max_ns = std::max(entry.compile_max_ns, elapsed_ns);
 			s_vu1_program_writers[buffer_index].fetch_sub(1, std::memory_order_release);
 			return;
 		}

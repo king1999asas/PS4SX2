@@ -3,6 +3,10 @@
 
 #pragma once
 
+#if defined(PCSX2_PS4_VM_BOOT)
+#include <chrono>
+#endif
+
 //------------------------------------------------------------------
 // Messages Called at Execution Time...
 //------------------------------------------------------------------
@@ -1033,6 +1037,11 @@ perf_and_return:
 // testing beyond the PS5 build.
 void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 {
+#if defined(PCSX2_PS4_VM_BOOT)
+	const bool profile_vu1_compile = mVU.index == 1 && PS4EEHotspots::VU1ProgramProfileEnabled();
+	const auto compile_started = profile_vu1_compile ? std::chrono::steady_clock::now() :
+		std::chrono::steady_clock::time_point{};
+#endif
 #ifdef ORBIS_VULKAN
 	struct EmitterScope
 	{
@@ -1054,7 +1063,16 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 		}
 	} emitter_scope(mVU);
 #endif
-	return mVUcompileBlock(mVU, startPC, pState);
+	void* entry = mVUcompileBlock(mVU, startPC, pState);
+#if defined(PCSX2_PS4_VM_BOOT)
+	if (profile_vu1_compile)
+	{
+		const u64 elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - compile_started).count());
+		PS4EEHotspots::RecordVU1Compile(startPC, elapsed_ns);
+	}
+#endif
+	return entry;
 }
 
 // Returns the entry point of the block (compiles it if not found)
