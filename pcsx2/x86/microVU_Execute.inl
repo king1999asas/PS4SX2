@@ -355,7 +355,7 @@ _mVUt void* mVUexecute(u32 startPC, u32 cycles)
 		const u64 quick = lp.quick64[0];
 		u32 h = (pc >> 3) ^ ((progStart >> 3) << 5) ^ static_cast<u32>(quick) ^ static_cast<u32>(quick >> 29);
 		h *= 0x9E3779B1u;
-		microVU::EntryCacheSlot& slot = mVU.entryCache[h >> 26];
+		microVU::EntryCacheSlot& slot = mVU.entryCache[h >> 24];
 		if (slot.generation == mVU.entryCacheGeneration && slot.entry && slot.quick == quick &&
 			slot.startPC == pc && slot.progStartPC == progStart)
 		{

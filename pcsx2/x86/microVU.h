@@ -146,7 +146,9 @@ struct microVU
 		u16 progStartPC;    // regs().start_pc: the program's start
 		u32 generation;     // entryCacheGeneration when filled
 	};
-	static constexpr u32 EntryCacheSlots = 64;
+	// Bee Movie's loaded-city capture repeatedly enters the same VU1 program with
+	// several pipeline states. Keep more of those hot variants resident at once.
+	static constexpr u32 EntryCacheSlots = 256;
 	alignas(64) u32 entryCacheGeneration; // bumped by every compile, clear, reset and close; older slots never hit
 	alignas(64) EntryCacheSlot entryCache[EntryCacheSlots];
 #endif
