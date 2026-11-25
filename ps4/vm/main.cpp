@@ -1711,6 +1711,7 @@ namespace BeeCarMute
 			switch (static_cast<AuditState>(s_audit[i].load(std::memory_order_relaxed)))
 			{
 				case AuditState::NotRead: ++not_read; break;
+				case AuditState::Matched: break;
 				case AuditState::WrongTag: ++wrong_tag; break;
 				case AuditState::WrongVolume: ++wrong_volume; break;
 				case AuditState::Applied: break;
