@@ -742,6 +742,11 @@ bool VMManager::HasAnyBindingsForPad(const SettingsInterface& si, u32 port)
 
 void VMManager::WarnAboutUnconfiguredController()
 {
+	// The PS4 port forwards scePad input directly in its VM poll loop, so the
+	// regular PCSX2 PadN binding lists are intentionally empty there.
+#if defined(PCSX2_PS4)
+	return;
+#else
 	std::unique_lock<std::mutex> lock = Host::GetSettingsLock();
 	SettingsInterface* si = Host::GetSettingsInterface();
 	if (!si || HasAnyBindingsForPad(*si, 0))
@@ -749,6 +754,7 @@ void VMManager::WarnAboutUnconfiguredController()
 
 	Host::AddIconOSDMessage("ControllerNotConfigured", ICON_FA_GAMEPAD,
 		TRANSLATE_STR("VMManager", "Controller 1 has no input bindings configured."), Host::OSD_WARNING_DURATION);
+#endif
 }
 
 void VMManager::ApplyGameFixes()

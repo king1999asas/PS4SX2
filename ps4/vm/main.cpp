@@ -147,6 +147,7 @@ static int s_pad = -1;
 static std::string s_selected_game;
 static bool s_use_vulkan_selector = false;
 static u32 s_previous_pad_buttons = 0;
+static u32 s_previous_pad_stick_directions = 0;
 static u32 s_previous_host_buttons = 0;
 static u32 s_blocked_pad_buttons = 0;
 static bool s_menu_chord_latched = false;
@@ -1119,31 +1120,56 @@ static void VMHostUpdateController(const OrbisPadData& data)
 	{
 		u32 host_mask;
 		u32 ps2_button;
+		const char* name;
 	};
 	static constexpr ButtonMapping mappings[] = {
-		{ORBIS_PAD_BUTTON_UP, PadDualshock2::Inputs::PAD_UP},
-		{ORBIS_PAD_BUTTON_RIGHT, PadDualshock2::Inputs::PAD_RIGHT},
-		{ORBIS_PAD_BUTTON_DOWN, PadDualshock2::Inputs::PAD_DOWN},
-		{ORBIS_PAD_BUTTON_LEFT, PadDualshock2::Inputs::PAD_LEFT},
-		{ORBIS_PAD_BUTTON_TRIANGLE, PadDualshock2::Inputs::PAD_TRIANGLE},
-		{ORBIS_PAD_BUTTON_CIRCLE, PadDualshock2::Inputs::PAD_CIRCLE},
-		{ORBIS_PAD_BUTTON_CROSS, PadDualshock2::Inputs::PAD_CROSS},
-		{ORBIS_PAD_BUTTON_SQUARE, PadDualshock2::Inputs::PAD_SQUARE},
-		{ORBIS_PAD_BUTTON_L1, PadDualshock2::Inputs::PAD_L1},
-		{ORBIS_PAD_BUTTON_R1, PadDualshock2::Inputs::PAD_R1},
-		{ORBIS_PAD_BUTTON_L3, PadDualshock2::Inputs::PAD_L3},
-		{ORBIS_PAD_BUTTON_R3, PadDualshock2::Inputs::PAD_R3},
-		{ORBIS_PAD_BUTTON_OPTIONS, PadDualshock2::Inputs::PAD_START},
-		{ORBIS_PAD_BUTTON_TOUCH_PAD, PadDualshock2::Inputs::PAD_SELECT},
+		{ORBIS_PAD_BUTTON_UP, PadDualshock2::Inputs::PAD_UP, "up"},
+		{ORBIS_PAD_BUTTON_RIGHT, PadDualshock2::Inputs::PAD_RIGHT, "right"},
+		{ORBIS_PAD_BUTTON_DOWN, PadDualshock2::Inputs::PAD_DOWN, "down"},
+		{ORBIS_PAD_BUTTON_LEFT, PadDualshock2::Inputs::PAD_LEFT, "left"},
+		{ORBIS_PAD_BUTTON_TRIANGLE, PadDualshock2::Inputs::PAD_TRIANGLE, "triangle"},
+		{ORBIS_PAD_BUTTON_CIRCLE, PadDualshock2::Inputs::PAD_CIRCLE, "circle"},
+		{ORBIS_PAD_BUTTON_CROSS, PadDualshock2::Inputs::PAD_CROSS, "cross"},
+		{ORBIS_PAD_BUTTON_SQUARE, PadDualshock2::Inputs::PAD_SQUARE, "square"},
+		{ORBIS_PAD_BUTTON_L1, PadDualshock2::Inputs::PAD_L1, "L1"},
+		{ORBIS_PAD_BUTTON_R1, PadDualshock2::Inputs::PAD_R1, "R1"},
+		{ORBIS_PAD_BUTTON_L3, PadDualshock2::Inputs::PAD_L3, "L3"},
+		{ORBIS_PAD_BUTTON_R3, PadDualshock2::Inputs::PAD_R3, "R3"},
+		{ORBIS_PAD_BUTTON_OPTIONS, PadDualshock2::Inputs::PAD_START, "options/start"},
+		{ORBIS_PAD_BUTTON_TOUCH_PAD, PadDualshock2::Inputs::PAD_SELECT, "touchpad/select"},
 	};
 	for (const ButtonMapping& mapping : mappings)
 	{
 		const bool was_pressed = (s_previous_pad_buttons & mapping.host_mask) != 0;
 		const bool is_pressed = (data.buttons & mapping.host_mask) != 0;
 		if (was_pressed != is_pressed)
+		{
 			Pad::SetControllerState(0, mapping.ps2_button, is_pressed ? 1.0f : 0.0f);
+			if (s_game_session)
+				ProbeLog("Controller input: t=%.3f %s=%s host=%08x ps2_bind=%u\n", s_run_timer.GetTimeSeconds(),
+					mapping.name, is_pressed ? "down" : "up", data.buttons, mapping.ps2_button);
+		}
 	}
 	s_previous_pad_buttons = data.buttons;
+
+	// Record only directional crossings, so analog-stick navigation can be checked
+	// in the session logs without sampling every small stick movement.
+	u32 stick_directions = 0;
+	if (data.leftStick.y < 72)
+		stick_directions |= ORBIS_PAD_BUTTON_UP;
+	else if (data.leftStick.y > 184)
+		stick_directions |= ORBIS_PAD_BUTTON_DOWN;
+	if (data.leftStick.x < 72)
+		stick_directions |= ORBIS_PAD_BUTTON_LEFT;
+	else if (data.leftStick.x > 184)
+		stick_directions |= ORBIS_PAD_BUTTON_RIGHT;
+	if (stick_directions != s_previous_pad_stick_directions)
+	{
+		s_previous_pad_stick_directions = stick_directions;
+		if (s_game_session)
+			ProbeLog("Controller input: t=%.3f left-stick directions=%08x axes=%u,%u\n",
+				s_run_timer.GetTimeSeconds(), stick_directions, data.leftStick.x, data.leftStick.y);
+	}
 
 	if (PadBase* pad = Pad::GetPad(0))
 	{
@@ -2212,7 +2238,7 @@ static void* RunVM(void*)
 		s_last_pause_log = 0.0;
 		s_last_input = -1.0;
 		s_last_ee_cycle = cpuRegs.cycle;
-		s_previous_pad_buttons = s_previous_host_buttons = 0;
+		s_previous_pad_buttons = s_previous_pad_stick_directions = s_previous_host_buttons = 0;
 		s_blocked_pad_buttons = ~u32{0}; // Consume any launcher button still held.
 		s_menu_chord_latched = s_game_menu_open = false;
 		s_game_menu_selection = 0;
