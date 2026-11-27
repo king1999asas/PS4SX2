@@ -312,6 +312,101 @@ FileMemoryCard::FileMemoryCard()
 
 FileMemoryCard::~FileMemoryCard() = default;
 
+// PS4 port: the memory card's ECC as MCMAN computes it (a Hamming code over each 128-byte
+// chunk of a page: column parity, then two line parities; the same as mymc's ps2mc_ecc).
+static void McdEccChunk(const u8* data, u8 out[3])
+{
+	static const u8 masks[7] = {0x55, 0x33, 0x0F, 0x00, 0xAA, 0xCC, 0xF0};
+	const auto parity = [](u32 v) { return static_cast<u32>(__builtin_popcount(v) & 1); };
+	u32 column = 0x77, line0 = 0x7F, line1 = 0x7F;
+	for (u32 i = 0; i < 128; i++)
+	{
+		const u8 b = data[i];
+		u32 column_mask = 0;
+		for (u32 m = 0; m < 7; m++)
+			column_mask |= parity(b & masks[m]) << m;
+		column ^= column_mask;
+		if (parity(b))
+		{
+			line0 ^= ~i;
+			line1 ^= i;
+		}
+	}
+	out[0] = static_cast<u8>(column);
+	out[1] = static_cast<u8>(line0 & 0x7F);
+	out[2] = static_cast<u8>(line1);
+}
+
+// PS4 port: pages of free clusters that MCMAN would reject. MCMAN reads every page of an
+// erase block before it rewrites the block, free clusters included, and gives up on a
+// page whose ECC does not match after five reads: a new save that needs a block nobody
+// has erased since the card file was made then fails ("error al guardar", the BIOS's
+// "could not copy"), while small writes into blocks already in use work. Such pages are
+// set to the erased state (all 0xFF, which MCMAN accepts), as on a real card. Only
+// clusters the FAT marks free are touched, and only pages that are neither erased nor
+// consistent with their ECC. Returns how many pages were reset; their offsets go to
+// `changed` so the caller can write them back.
+static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* changed)
+{
+	static constexpr char Magic[] = "Sony PS2 Memory Card Format ";
+	if (image.size() < 0x200 || std::memcmp(image.data(), Magic, sizeof(Magic) - 1) != 0)
+		return 0;
+	const auto rd16 = [](const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8)); };
+	const auto rd32 = [](const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<u32>(p[3]) << 24)); };
+	const u8* sb = image.data();
+	const u32 page_len = rd16(sb + 0x28), ppc = rd16(sb + 0x2A), clusters = rd32(sb + 0x30);
+	const u32 alloc_offset = rd32(sb + 0x34), alloc_end = rd32(sb + 0x38);
+	const u8 card_flags = sb[0x151];
+	if (page_len != 512 || ppc == 0 || ppc > 16 || clusters == 0 || alloc_end == 0 || alloc_offset + alloc_end > clusters ||
+		!(card_flags & 0x01)) // CF_USE_ECC
+		return 0;
+	const size_t raw_page = page_len + 16;
+	if (image.size() < static_cast<size_t>(clusters) * ppc * raw_page)
+		return 0; // no ECC bytes in this file
+	const u32 per_cluster = page_len * ppc / 4;
+	const auto page_at = [&](u32 page) { return &image[static_cast<size_t>(page) * raw_page]; };
+	// The FAT, read straight from the image (cluster numbers in the IFC list are absolute).
+	const auto cluster_word = [&](u32 cluster, u32 index, u32* out) -> bool {
+		const u32 byte = index * 4, page = cluster * ppc + byte / page_len;
+		if (static_cast<size_t>(page + 1) * raw_page > image.size())
+			return false;
+		*out = rd32(page_at(page) + byte % page_len);
+		return true;
+	};
+	u32 reset = 0;
+	for (u32 c = 0; c < alloc_end; c++)
+	{
+		const u32 fat_index = c / per_cluster, indirect_index = fat_index / per_cluster;
+		u32 fat_cluster = 0, entry = 0;
+		if (indirect_index >= 32 || !cluster_word(rd32(sb + 0x50 + indirect_index * 4), fat_index % per_cluster, &fat_cluster) ||
+			!cluster_word(fat_cluster, c % per_cluster, &entry))
+			return reset; // FAT unreadable: leave the rest alone
+		if (entry & 0x80000000u)
+			continue; // in use
+		for (u32 p = 0; p < ppc; p++)
+		{
+			const u32 page = (alloc_offset + c) * ppc + p;
+			u8* data = page_at(page);
+			if (std::all_of(data, data + raw_page, [](u8 b) { return b == 0xFF; }))
+				continue; // erased
+			bool ecc_ok = true;
+			for (u32 chunk = 0; chunk < page_len / 128 && ecc_ok; chunk++)
+			{
+				u8 ecc[3];
+				McdEccChunk(data + chunk * 128, ecc);
+				ecc_ok = std::memcmp(ecc, data + page_len + chunk * 3, 3) == 0;
+			}
+			if (ecc_ok)
+				continue; // an old deleted file's data: valid, leave it
+			std::memset(data, 0xFF, raw_page);
+			reset++;
+			if (changed)
+				changed->push_back(static_cast<u32>(static_cast<size_t>(page) * raw_page));
+		}
+	}
+	return reset;
+}
+
 static void LogCardContents(uint slot, const std::vector<u8>& image, const char* when);
 
 void FileMemoryCard::Open()
@@ -437,6 +532,18 @@ bool FileMemoryCard::LoadCache(uint slot)
 	m_cache[slot] = std::move(image);
 	m_dirty[slot].assign((m_cache[slot].size() + MC2_ERASE_SIZE - 1) / MC2_ERASE_SIZE, 0);
 	m_dirty_any[slot] = false;
+	{
+		std::vector<u32> changed;
+		const u32 reset = RepairFreeClusterPages(m_cache[slot], &changed);
+		if (reset)
+		{
+			for (const u32 offset : changed)
+				MarkDirty(slot, offset, 528);
+			std::printf("[mcd] slot %u: %u page(s) of free clusters were neither erased nor ECC-consistent; set to erased "
+						"(first at byte 0x%X, page 0x%X)\n",
+				slot, reset, changed.front(), changed.front() / 528);
+		}
+	}
 	g_orbis_mcd_cached.fetch_or(1 << slot, std::memory_order_relaxed);
 	g_orbis_mcd_ticks.fetch_add(__builtin_ia32_rdtsc() - t0, std::memory_order_relaxed);
 	std::printf("[mcd] slot %u: %s in RAM (%lld bytes, read in %.1f ms)\n", slot,
