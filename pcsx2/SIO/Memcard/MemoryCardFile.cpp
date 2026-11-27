@@ -337,17 +337,25 @@ static void McdEccChunk(const u8* data, u8 out[3])
 	out[2] = static_cast<u8>(line1);
 }
 
-// PS4 port: pages of free clusters that MCMAN would reject. MCMAN reads every page of an
-// erase block before it rewrites the block, free clusters included, and gives up on a
-// page whose ECC does not match after five reads: a new save that needs a block nobody
-// has erased since the card file was made then fails ("error al guardar", the BIOS's
-// "could not copy"), while small writes into blocks already in use work. Such pages are
-// set to the erased state (all 0xFF, which MCMAN accepts), as on a real card. Only
-// clusters the FAT marks free are touched, and only pages that are neither erased nor
-// consistent with their ECC. Returns how many pages were reset; their offsets go to
-// `changed` so the caller can write them back.
-static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* changed)
+// PS4 port: pages MCMAN would reject in clusters no file uses. MCMAN reads every page of
+// an erase block before it rewrites the block, and gives up on a page whose ECC does not
+// match after five reads: a new save that needs such a block then fails ("error al
+// guardar", the BIOS's "could not copy"), while small writes into blocks already in use
+// work. Those pages are set to the erased state (all 0xFF, which MCMAN accepts), as on a
+// real card, in two kinds of cluster:
+// - free ones (the FAT says so);
+// - orphans: marked in use but reached by no directory or file. A save cut short leaves
+//   them: MCMAN had allocated the icon's clusters, the file stayed at 0 bytes without
+//   pointing to them, and deleting the save does not free them. Their FAT entries are
+//   left as they are (a few KB stay used); only their pages change.
+// Orphans are only considered when the whole directory tree could be walked. Pages that
+// are erased or consistent with their ECC are never touched (an old deleted file's data
+// stays). Returns how many pages were reset; their offsets go to `changed` so the caller
+// can write them back, and the orphan count to `orphans`.
+static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* changed, u32* orphans = nullptr)
 {
+	if (orphans)
+		*orphans = 0;
 	static constexpr char Magic[] = "Sony PS2 Memory Card Format ";
 	if (image.size() < 0x200 || std::memcmp(image.data(), Magic, sizeof(Magic) - 1) != 0)
 		return 0;
@@ -355,7 +363,7 @@ static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* chan
 	const auto rd32 = [](const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<u32>(p[3]) << 24)); };
 	const u8* sb = image.data();
 	const u32 page_len = rd16(sb + 0x28), ppc = rd16(sb + 0x2A), clusters = rd32(sb + 0x30);
-	const u32 alloc_offset = rd32(sb + 0x34), alloc_end = rd32(sb + 0x38);
+	const u32 alloc_offset = rd32(sb + 0x34), alloc_end = rd32(sb + 0x38), root = rd32(sb + 0x3C);
 	const u8 card_flags = sb[0x151];
 	if (page_len != 512 || ppc == 0 || ppc > 16 || clusters == 0 || alloc_end == 0 || alloc_offset + alloc_end > clusters ||
 		!(card_flags & 0x01)) // CF_USE_ECC
@@ -363,26 +371,108 @@ static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* chan
 	const size_t raw_page = page_len + 16;
 	if (image.size() < static_cast<size_t>(clusters) * ppc * raw_page)
 		return 0; // no ECC bytes in this file
-	const u32 per_cluster = page_len * ppc / 4;
+	const u32 cluster_size = page_len * ppc, per_cluster = cluster_size / 4;
 	const auto page_at = [&](u32 page) { return &image[static_cast<size_t>(page) * raw_page]; };
-	// The FAT, read straight from the image (cluster numbers in the IFC list are absolute).
+	// A 32-bit word of an absolute cluster (the IFC list and the FAT use absolute numbers).
 	const auto cluster_word = [&](u32 cluster, u32 index, u32* out) -> bool {
 		const u32 byte = index * 4, page = cluster * ppc + byte / page_len;
-		if (static_cast<size_t>(page + 1) * raw_page > image.size())
+		if (cluster >= clusters || static_cast<size_t>(page + 1) * raw_page > image.size())
 			return false;
 		*out = rd32(page_at(page) + byte % page_len);
 		return true;
 	};
-	u32 reset = 0;
+	std::vector<u32> fat(alloc_end);
 	for (u32 c = 0; c < alloc_end; c++)
 	{
 		const u32 fat_index = c / per_cluster, indirect_index = fat_index / per_cluster;
-		u32 fat_cluster = 0, entry = 0;
+		u32 fat_cluster = 0;
 		if (indirect_index >= 32 || !cluster_word(rd32(sb + 0x50 + indirect_index * 4), fat_index % per_cluster, &fat_cluster) ||
-			!cluster_word(fat_cluster, c % per_cluster, &entry))
-			return reset; // FAT unreadable: leave the rest alone
-		if (entry & 0x80000000u)
-			continue; // in use
+			!cluster_word(fat_cluster, c % per_cluster, &fat[c]))
+			return 0; // FAT unreadable: leave the card alone
+	}
+
+	// Which clusters the directory tree reaches. Any inconsistency turns orphan handling off.
+	std::vector<u8> reached(alloc_end, 0);
+	bool tree_ok = true;
+	const auto follow = [&](u32 start, std::vector<u32>* list) -> bool {
+		list->clear();
+		u32 c = start;
+		while (list->size() <= alloc_end)
+		{
+			if (c >= alloc_end)
+				return false;
+			list->push_back(c);
+			reached[c] = 1;
+			const u32 e = fat[c];
+			if (!(e & 0x80000000u))
+				return false;
+			if (e == 0xFFFFFFFFu)
+				return true;
+			c = e & 0x7FFFFFFFu;
+		}
+		return false;
+	};
+	const auto entry_word = [&](const std::vector<u32>& dir, u32 index, u32 offset, u32* out) -> bool {
+		const u32 byte = index * 512 + offset;
+		if (byte / cluster_size >= dir.size())
+			return false;
+		return cluster_word(alloc_offset + dir[byte / cluster_size], (byte % cluster_size) / 4, out);
+	};
+	{
+		struct Pending
+		{
+			u32 cluster, depth;
+		};
+		std::vector<Pending> pending{{root, 0}};
+		std::vector<u32> dir, chain;
+		u32 visited_dirs = 0;
+		while (!pending.empty() && tree_ok)
+		{
+			const Pending d = pending.back();
+			pending.pop_back();
+			if (d.depth > 8 || ++visited_dirs > 4096)
+			{
+				tree_ok = false; // not a PS2 card layout: no orphans
+				break;
+			}
+			// A broken chain (a save cut short) still marks what it reaches; the clusters past the
+			// break count as unused, which only matters for their pages that fail ECC anyway.
+			u32 dot_mode = 0, entries = 0;
+			follow(d.cluster, &dir);
+			if (dir.empty() || !entry_word(dir, 0, 0, &dot_mode) || !entry_word(dir, 0, 4, &entries))
+			{
+				if (d.depth == 0)
+					tree_ok = false; // no root directory: no orphans
+				continue;
+			}
+			entries = std::min<u32>(entries, 65536);
+			for (u32 i = 2; i < entries; i++)
+			{
+				u32 mode = 0, length = 0, first = 0;
+				if (!entry_word(dir, i, 0, &mode) || !entry_word(dir, i, 4, &length) || !entry_word(dir, i, 0x10, &first))
+					break; // past what the directory's chain reaches
+				mode &= 0xFFFF;
+				if (!(mode & 0x8000))
+					continue; // deleted entry
+				if (mode & 0x20)
+				{
+					if (first < alloc_end && !reached[first])
+						pending.push_back({first, d.depth + 1});
+				}
+				else if (first < alloc_end)
+					follow(first, &chain); // any cluster a file points to counts, even for a 0-byte file
+			}
+		}
+	}
+
+	u32 reset = 0, orphan_count = 0;
+	for (u32 c = 0; c < alloc_end; c++)
+	{
+		const bool in_use = (fat[c] & 0x80000000u) != 0;
+		const bool orphan = in_use && tree_ok && !reached[c];
+		orphan_count += orphan;
+		if (in_use && !orphan)
+			continue;
 		for (u32 p = 0; p < ppc; p++)
 		{
 			const u32 page = (alloc_offset + c) * ppc + p;
@@ -397,13 +487,15 @@ static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* chan
 				ecc_ok = std::memcmp(ecc, data + page_len + chunk * 3, 3) == 0;
 			}
 			if (ecc_ok)
-				continue; // an old deleted file's data: valid, leave it
+				continue; // valid data (an old deleted file's): leave it
 			std::memset(data, 0xFF, raw_page);
 			reset++;
 			if (changed)
 				changed->push_back(static_cast<u32>(static_cast<size_t>(page) * raw_page));
 		}
 	}
+	if (orphans)
+		*orphans = orphan_count;
 	return reset;
 }
 
@@ -534,15 +626,20 @@ bool FileMemoryCard::LoadCache(uint slot)
 	m_dirty_any[slot] = false;
 	{
 		std::vector<u32> changed;
-		const u32 reset = RepairFreeClusterPages(m_cache[slot], &changed);
+		u32 orphans = 0;
+		const u32 reset = RepairFreeClusterPages(m_cache[slot], &changed, &orphans);
+		if (orphans)
+			std::printf("[mcd] slot %u: %u cluster(s) marked in use belong to no file (left by saves cut short)\n", slot, orphans);
 		if (reset)
 		{
 			for (const u32 offset : changed)
 				MarkDirty(slot, offset, 528);
-			std::printf("[mcd] slot %u: %u page(s) of free clusters were neither erased nor ECC-consistent; set to erased "
+			std::printf("[mcd] slot %u: %u page(s) in clusters no file uses were neither erased nor ECC-consistent; set to erased "
 						"(first at byte 0x%X, page 0x%X)\n",
 				slot, reset, changed.front(), changed.front() / 528);
 		}
+		else
+			std::printf("[mcd] slot %u: no unusable pages in clusters no file uses\n", slot);
 	}
 	g_orbis_mcd_cached.fetch_or(1 << slot, std::memory_order_relaxed);
 	g_orbis_mcd_ticks.fetch_add(__builtin_ia32_rdtsc() - t0, std::memory_order_relaxed);
