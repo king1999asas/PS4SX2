@@ -7,6 +7,7 @@
 #include "Common.h"
 #include "Sif.h"
 #include "IopHw.h"
+#include "SIO/Memcard/PS4McdTrace.h"
 
 _sif sif0;
 
@@ -89,6 +90,7 @@ static __fi bool ProcessEETag()
 
 	SIF_LOG("SIF0 EE dest chain tag madr:%08X qwc:%04X id:%X irq:%d(%08X_%08X)",
 		sif0ch.madr, sif0ch.qwc, ptag.ID, ptag.IRQ, tag[1], tag[0]);
+	PS4McdTrace::Sif("sif0 ee", sif0ch.madr, sif0ch.qwc * 16, ptag.ID);
 
 	if (sif0ch.chcr.TIE && ptag.IRQ)
 	{
@@ -138,6 +140,7 @@ static __fi bool ProcessIOPTag()
 
 	// IOP tags have an IRQ bit and an End of Transfer bit:
 	if (sif0tag.IRQ  || (sif0tag.ID & 4)) sif0.iop.end = true;
+	PS4McdTrace::Sif("sif0 iop", hw_dma9.madr, sif0.iop.counter * 4, sif0tag.ID);
 	SIF_LOG("SIF0 IOP Tag: madr=%lx, tadr=%lx, counter=%lx (%08X_%08X) Junk %d", hw_dma9.madr, hw_dma9.tadr, sif0.iop.counter, sif0words, sif0data, sif0.iop.writeJunk);
 
 	return true;

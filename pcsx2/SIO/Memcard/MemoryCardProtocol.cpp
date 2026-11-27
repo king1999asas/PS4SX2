@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "SIO/Memcard/MemoryCardProtocol.h"
+#include "SIO/Memcard/PS4McdTrace.h"
 
 #include "SIO/Sio.h"
 #include "SIO/Sio2.h"
@@ -10,6 +11,8 @@
 #include "common/Assertions.h"
 #include "common/Console.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 
 #define MC_LOG_ENABLE 0
@@ -540,3 +543,125 @@ void MemoryCardProtocol::AuthF7()
 	PS1_FAIL();
 	The2bTerminator(5);
 }
+
+namespace PS4McdTrace
+{
+	namespace
+	{
+		using Clock = std::chrono::steady_clock;
+		const Clock::time_point s_start = Clock::now();
+		Clock::time_point s_last_card = Clock::time_point::min();
+		u32 s_lines = 0;
+		constexpr u32 MaxLines = 60000;
+		// The sector being summed up.
+		bool s_open = false;
+		u32 s_port = 0, s_slot = 0, s_sector = 0;
+		u8 s_select = 0;
+		u32 s_read = 0, s_write = 0, s_erase = 0, s_end = 0, s_reads = 0, s_writes = 0;
+		u32 s_probes = 0, s_other = 0;
+		u8 s_term = 0x55;
+
+		double Ms() { return std::chrono::duration<double, std::milli>(Clock::now() - s_start).count(); }
+
+		bool Emit()
+		{
+			if (s_lines >= MaxLines)
+				return false;
+			if (++s_lines == MaxLines)
+				std::printf("[mct] trace limit reached (%u lines)\n", MaxLines);
+			return s_lines < MaxLines;
+		}
+
+		// close = false: print what the open sector has so far and keep it open (a SIF
+		// transfer in the middle of its commands).
+		void Flush(bool close = true)
+		{
+			if (!s_open)
+				return;
+			const bool any = s_reads || s_writes || s_erase || s_end || s_probes || s_other;
+			if (close)
+				s_open = false;
+			else if (!any)
+				return;
+			if (!Emit())
+				return;
+			const char* kind = s_select == 0x21 ? "erase-sel" : s_select == 0x22 ? "write-sel" : s_select == 0x23 ? "read-sel" : "sel";
+			std::printf("[mct] %10.1f mc%u%c %-9s sector %06X (byte %08X): read %u B/%u, write %u B/%u, erase %u, end %u, probes %u, other %u, term %02X\n",
+				Ms(), s_port + 1, 'A' + s_slot, kind, s_sector, s_sector * 528, s_read, s_reads, s_write, s_writes, s_erase, s_end,
+				s_probes, s_other, s_term);
+			s_read = s_write = s_erase = s_end = s_reads = s_writes = s_probes = s_other = 0;
+		}
+	} // namespace
+
+	void Command(u32 port, u32 slot, u8 command, u8 first_byte, u32 sector, bool ejected)
+	{
+		// Card data commands open the SIF window; the periodic probes of a game do not.
+		if (command == 0x21 || command == 0x22 || command == 0x23 || command == 0x42 || command == 0x43 || command == 0x82)
+			s_last_card = Clock::now();
+		if (ejected)
+		{
+			Flush();
+			if (Emit())
+				std::printf("[mct] %10.1f mc%u%c command %02X while auto-ejected (card shown as removed)\n", Ms(), port + 1, 'A' + slot,
+					command);
+			return;
+		}
+		switch (command)
+		{
+			case 0x21:
+			case 0x22:
+			case 0x23:
+				Flush();
+				s_open = true;
+				s_port = port;
+				s_slot = slot;
+				s_sector = sector;
+				s_select = command;
+				return;
+			case 0x11: // probe
+				s_probes++;
+				return;
+			case 0x27: // set terminator
+				s_term = first_byte;
+				s_other++;
+				return;
+			default:
+				break;
+		}
+		if (!s_open)
+		{
+			// Commands with no sector selected (specs, auth, boot): one line each, except repeats.
+			static u8 last = 0;
+			static u32 repeats = 0;
+			if (command == last && repeats < 1000)
+			{
+				repeats++;
+				return;
+			}
+			if (Emit())
+				std::printf("[mct] %10.1f mc%u%c command %02X (%u repeat(s) of %02X before)\n", Ms(), port + 1, 'A' + slot, command, repeats,
+					last);
+			last = command;
+			repeats = 0;
+			return;
+		}
+		switch (command)
+		{
+			case 0x42: s_write += first_byte; s_writes++; break;
+			case 0x43: s_read += first_byte; s_reads++; break;
+			case 0x81: s_end++; break;
+			case 0x82: s_erase++; break;
+			default: s_other++; break;
+		}
+	}
+
+	void Sif(const char* what, u32 address, u32 bytes, u32 id)
+	{
+		// Only around card use (3 s after its last command): the save's own transfers.
+		if (s_last_card == Clock::time_point::min() || Clock::now() - s_last_card > std::chrono::seconds(3))
+			return;
+		Flush(false);
+		if (Emit())
+			std::printf("[mct] %10.1f %-8s addr %08X %7u B id %u\n", Ms(), what, address, bytes, id);
+	}
+} // namespace PS4McdTrace
