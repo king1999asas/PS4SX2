@@ -411,7 +411,7 @@ namespace PS4GameMenu
 				{"Saltar", "Mostrar"}, 2},
 			{"Sonido", "Desactivado: el sonido no se calcula y libera algo de CPU.",
 				{"Activado", "Desactivado"}, 2},
-			{"Precisión matemática", "Rápida libera algo de CPU pero puede dejar pantalla negra o sin sonido. Mejor Normal.",
+			{"Precisión matemática", "Rápida acelera la geometría 3D (VU1) sin tocar la lógica ni el sonido; puede causar fallos de imagen. Mejor Normal.",
 				{"Normal", "Rápida"}, 2},
 			{"Prioridad de hilos", "Alta evita que el sistema frene al emulador. Se aplica al volver a abrir PS4SX2.",
 				{"Alta", "Normal"}, 2},

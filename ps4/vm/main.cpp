@@ -1836,7 +1836,9 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 	for (const char* key : {"vu0Overflow", "vu0ExtraOverflow", "vu0SignOverflow", "vu0Underflow", "vu1Overflow",
 			 "vu1ExtraOverflow", "vu1SignOverflow", "vu1Underflow", "fpuOverflow", "fpuExtraOverflow", "fpuFullMode"})
 	{
-		if (fast_math)
+		// Only VU1 (the 3D geometry): its clamps cost two instructions per result, and VU1 is what
+		// holds Bee Movie's city back. The EE FPU and VU0 run game logic and sound and stay exact.
+		if (fast_math && std::strncmp(key, "vu1", 3) == 0)
 			settings->SetBoolValue("EmuCore/CPU/Recompiler", key, false);
 		else
 			settings->DeleteValue("EmuCore/CPU/Recompiler", key);

@@ -2510,6 +2510,7 @@ u32 GSState::CalcMask(int exp, int max_exp)
 
 void GSState::FlushPrim()
 {
+	PS4_GS_SCOPE(FlushPrim);
 	if (m_index->tail > 0)
 	{
 		GL_REG("FlushPrim ctxt %d", PRIM->CTXT);
@@ -2585,7 +2586,10 @@ void GSState::FlushPrim()
 #endif
 		// Update scissor, it may have been modified by a previous draw
 		m_env.CTXT[PRIM->CTXT].UpdateScissor();
-		m_vt.Update(vtx_buff.buff, idx_buff.buff, vtx_buff.tail, idx_buff.tail, GSUtil::GetPrimClass(PRIM->PRIM));
+		{
+			PS4_GS_SCOPE(VertexTrace);
+			m_vt.Update(vtx_buff.buff, idx_buff.buff, vtx_buff.tail, idx_buff.tail, GSUtil::GetPrimClass(PRIM->PRIM));
+		}
 
 		// Texel coordinate rounding
 		// Helps Manhunt (lights shining through objects).

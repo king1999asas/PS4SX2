@@ -25,6 +25,10 @@ namespace PS4GSProfile
 		TextureUpdate,
 		Readback,
 		SWSprite,
+		FlushPrim,     // GSState::FlushPrim: one batch of primitives, vertex trace and draw included
+		VertexTrace,   // GSVertexTrace::Update: the batch's bounds, colours and texture coordinates
+		TCLookupSource, // GSTextureCache::LookupSource: the texture a draw reads
+		TCLookupTarget, // GSTextureCache::LookupDrawTarget: the render target or depth buffer
 		Count
 	};
 	enum GIFKind
@@ -66,7 +70,7 @@ namespace PS4GSProfile
 				return;
 			auto& c = counters[kind];
 			++c.calls;
-			if (kind == HWDraw || kind == VKRender || kind == TextureUpdate || kind == SWSprite)
+			if (kind == HWDraw || kind == VKRender || kind == TextureUpdate || kind == SWSprite || kind >= FlushPrim)
 			{
 				c.random = c.random * 1664525U + 1013904223U;
 				if ((c.random >> 26) != 0) // Time roughly 1/64 hot calls.
