@@ -312,6 +312,8 @@ FileMemoryCard::FileMemoryCard()
 
 FileMemoryCard::~FileMemoryCard() = default;
 
+static void LogCardContents(uint slot, const std::vector<u8>& image, const char* when);
+
 void FileMemoryCard::Open()
 {
 	for (int slot = 0; slot < 8; ++slot)
