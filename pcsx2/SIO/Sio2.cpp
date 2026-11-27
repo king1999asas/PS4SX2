@@ -6,7 +6,6 @@
 #include "IopDma.h"
 #include "Recording/InputRecording.h"
 #include "SIO/Memcard/MemoryCardProtocol.h"
-#include "SIO/Memcard/PS4McdTrace.h"
 #include "SIO/Multitap/MultitapProtocol.h"
 #include "SIO/Pad/Pad.h"
 #include "SIO/Pad/PadBase.h"
@@ -256,7 +255,6 @@ void Sio2::Memcard()
 	// and zero out the fifo to simulate dead air over the wire.
 	if (mcd->autoEjectTicks)
 	{
-		PS4McdTrace::Command(port, mtap.GetMemcardSlot(), g_Sio2FifoIn.empty() ? 0 : g_Sio2FifoIn.front(), 0, mcd->sectorAddr, true);
 		SetCmdStat(CmdStat::DISCONNECTED);
 		g_Sio2FifoOut.push_back(0xff); // Because Sio2::Write pops the first g_Sio2FifoIn member
 
@@ -273,7 +271,6 @@ void Sio2::Memcard()
 
 	const u8 commandByte = g_Sio2FifoIn.front();
 	g_Sio2FifoIn.pop_front();
-	const u8 firstDataByte = g_Sio2FifoIn.empty() ? 0 : g_Sio2FifoIn.front(); // PS4 trace: length of 42/43, value of 27
 	const u8 responseByte = mcd->IsPresent() ? 0x00 : 0xff;
 	g_Sio2FifoOut.push_back(responseByte);
 	g_Sio2FifoOut.push_back(responseByte);
@@ -378,7 +375,6 @@ void Sio2::Memcard()
 			Console.Warning("%s() Unhandled memcard command %02X, things are about to break!", __FUNCTION__, commandByte);
 			break;
 	}
-	PS4McdTrace::Command(port, mtap.GetMemcardSlot(), commandByte, firstDataByte, mcd->sectorAddr, false);
 }
 
 void Sio2::Write(u8 data)

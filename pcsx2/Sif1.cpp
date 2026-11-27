@@ -7,7 +7,6 @@
 #include "Common.h"
 #include "Sif.h"
 #include "IopHw.h"
-#include "SIO/Memcard/PS4McdTrace.h"
 
 _sif sif1;
 
@@ -91,7 +90,6 @@ static __fi bool ProcessEETag()
 
 	SIF_LOG("%s", ptag->tag_to_str().c_str());
 	sif1ch.madr = ptag[1]._u32;
-	PS4McdTrace::Sif("sif1 ee", sif1ch.madr, sif1ch.qwc * 16, ptag->ID);
 
 	sif1.ee.end = hwDmacSrcChain(sif1ch, ptag->ID);
 
@@ -122,7 +120,6 @@ static __fi bool SIFIOPReadTag()
 	sif1.iop.counter = sif1words & 0xFFFFC;
 
 	if (sif1tag.IRQ  || (sif1tag.ID & 4)) sif1.iop.end = true;
-	PS4McdTrace::Sif("sif1 iop", hw_dma10.madr, sif1.iop.counter * 4, sif1tag.ID);
 
 	return true;
 }

@@ -155,7 +155,7 @@ u32 g_ps4_bytecopy_last_destination = 0;
 // step the pointer) run natively in batches. Unlike the copy fusion this works
 // with exact SMC checks: the fill only writes data pages, blocks on manually
 // checked pages verify their own code, and write-protected code pages decline.
-bool g_ps4_bytefill_fusion = false; // off by default (see main.cpp)
+bool g_ps4_bytefill_fusion = true;
 static bool s_ps4_bytefill_loop;
 static u32 s_ps4_bytefill_config;
 u64 g_ps4_bytefill_blocks = 0;
