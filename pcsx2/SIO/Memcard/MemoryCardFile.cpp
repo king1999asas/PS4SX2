@@ -561,8 +561,8 @@ static void LogCardContents(uint slot, const std::vector<u8>& image, const char*
 	struct Save
 	{
 		DirEntry dir;
-		u32 files = 0, bytes = 0, broken = 0;
-		std::string first_broken;
+		u32 files = 0, bytes = 0, broken = 0, empty = 0;
+		std::string first_broken, listing;
 	};
 	std::vector<Save> saves;
 	u32 bad_root = 0;
@@ -598,6 +598,15 @@ static void LogCardContents(uint slot, const std::vector<u8>& image, const char*
 					continue;
 				save.files++;
 				save.bytes += file.length;
+				save.empty += file.length == 0;
+				{
+					const u8* t = file.modified;
+					char line[96];
+					std::snprintf(line, sizeof(line), "[mcd]       %-32s %7u bytes  %02u:%02u:%02u\n", file.name, file.length, t[3],
+						t[2], t[1]);
+					if (save.listing.size() < 2048)
+						save.listing += line;
+				}
 				const u32 needed = (file.length + cluster_size - 1) / cluster_size;
 				if (needed && (!chain(file.cluster, &file_clusters) || file_clusters.size() < needed))
 				{
@@ -623,9 +632,12 @@ static void LogCardContents(uint slot, const std::vector<u8>& image, const char*
 	{
 		const Save& save = saves[i];
 		const u8* t = save.dir.modified; // PS2 time (JST): sec, min, hour, day, month, year
-		std::printf("[mcd]   %-32s %2u file(s) %5u KiB  %04u-%02u-%02u %02u:%02u%s%s\n", save.dir.name, save.files,
+		std::printf("[mcd]   %-32s %2u file(s) %5u KiB  %04u-%02u-%02u %02u:%02u%s%s%s\n", save.dir.name, save.files,
 			(save.bytes + 1023) / 1024, rd16(t + 6), t[5], t[4], t[3], t[2], save.broken ? "  BROKEN: " : "",
-			save.broken ? save.first_broken.c_str() : "");
+			save.broken ? save.first_broken.c_str() : "", save.empty ? "  EMPTY FILE(S)" : "");
+		// The newest save and any save with a problem: its files (name, size, time written).
+		if (i == 0 || save.broken || save.empty)
+			std::fputs(save.listing.c_str(), stdout);
 	}
 	if (saves.size() > 64)
 		std::printf("[mcd]   ... %zu more\n", saves.size() - 64);

@@ -1891,7 +1891,9 @@ static void ApplyLauncherSettings(SettingsInterface* settings, bool& fast_boot)
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 	g_ps4_skip_smc_checks = access("/data/PS4SX2/vm-skip-smc", F_OK) == 0;
 	g_ps4_bytecopy_fusion = g_ps4_skip_smc_checks && access("/data/PS4SX2/vm-no-bytecopy-fusion", F_OK) != 0;
-	g_ps4_bytefill_fusion = access("/data/PS4SX2/vm-no-bytefill-fusion", F_OK) != 0;
+	// Off by default since memory card saves started failing after it was added (PKG-35);
+	// /data/PS4SX2/vm-bytefill-fusion switches it back on.
+	g_ps4_bytefill_fusion = access("/data/PS4SX2/vm-bytefill-fusion", F_OK) == 0;
 #endif
 	VMManager::ApplySettings();
 	ProbeLog("Launcher settings applied: EE rate=%d skip=%d fastCDVD=%d fastBoot=%d audio=%d readback=%d minBlend=%d fastMath=%d\n",
@@ -2113,10 +2115,13 @@ static void* RunVM(void*)
 	g_ps4_bytecopy_last_source = g_ps4_bytecopy_last_destination = 0;
 	ProbeLog("EE byte-copy fusion: %s (disable with /data/PS4SX2/vm-no-bytecopy-fusion)\n",
 		g_ps4_bytecopy_fusion ? "enabled with inline deadline gate, mapped RAM batches and native fallback" : "disabled by marker or exact SMC checks");
-	g_ps4_bytefill_fusion = access("/data/PS4SX2/vm-no-bytefill-fusion", F_OK) != 0;
+	// Off by default since memory card saves started failing after it was added (PKG-35);
+	// /data/PS4SX2/vm-bytefill-fusion switches it back on.
+	g_ps4_bytefill_fusion = access("/data/PS4SX2/vm-bytefill-fusion", F_OK) == 0;
 	g_ps4_bytefill_blocks = g_ps4_bytefill_runs = g_ps4_bytefill_bytes = g_ps4_bytefill_declined = 0;
-	ProbeLog("EE byte-fill fusion: %s (disable with /data/PS4SX2/vm-no-bytefill-fusion)\n",
-		g_ps4_bytefill_fusion ? "enabled (memset byte loops run natively, page and event bounded)" : "disabled by marker");
+	ProbeLog("EE byte-fill fusion: %s\n",
+		g_ps4_bytefill_fusion ? "enabled by /data/PS4SX2/vm-bytefill-fusion (memset byte loops run natively, page and event bounded)" :
+		                        "disabled (default; enable with /data/PS4SX2/vm-bytefill-fusion)");
 #endif
 	// (AI-assisted) This process has never initialized Piglet. The recovery
 	// selector and the VM share only the Vulkan backend on the GS thread.
