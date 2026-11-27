@@ -67,69 +67,96 @@ namespace
 	};
 } // namespace
 
+namespace
+{
+	// SceHttp method ids (SCE_HTTP_METHOD_GET / _POST).
+	constexpr int HttpMethodGet = 0;
+	constexpr int HttpMethodPost = 1;
+
+	bool Send(int method, const std::string& url, const char* user_agent, const std::string* body,
+		const char* content_type, std::vector<unsigned char>& bytes, size_t max_bytes)
+	{
+		bytes.clear();
+		const int context = HttpContext();
+		if (context < 0 || url.empty() || !user_agent || max_bytes == 0)
+			return false;
+		Request request;
+		request.tmpl = sceHttpCreateTemplate(context, user_agent, ORBIS_HTTP_VERSION_1_1, 0);
+		ProbeLog("Native HTTPS: template=%#x url=%s\n", request.tmpl, url.c_str());
+		if (request.tmpl < 0)
+			return false;
+		for (int rc : {sceHttpsEnableOption(request.tmpl, 0xbd),
+			sceHttpSetResolveTimeOut(request.tmpl, 4000000),
+			sceHttpSetConnectTimeOut(request.tmpl, 4000000),
+			sceHttpSetSendTimeOut(request.tmpl, 4000000),
+			CoverHttpRecvTimeout(request.tmpl, 4000000),
+			CoverHttpAutoRedirect(request.tmpl, 0)})
+		{
+			if (rc < 0)
+			{
+				ProbeLog("Native HTTPS: setup failed=%#x url=%s\n", rc, url.c_str());
+				return false;
+			}
+		}
+		request.connection = sceHttpCreateConnectionWithURL(request.tmpl, url.c_str(), false);
+		if (request.connection < 0)
+			return false;
+		const size_t body_size = body ? body->size() : 0;
+		request.request = sceHttpCreateRequestWithURL(request.connection,
+			static_cast<decltype(ORBIS_METHOD_GET)>(method), url.c_str(), body_size);
+		if (request.request < 0)
+			return false;
+		const bool headers_ok = method == HttpMethodPost ?
+			(sceHttpAddRequestHeader(request.request, "User-Agent", user_agent, 0) >= 0 &&
+				sceHttpAddRequestHeader(request.request, "Accept", "*/*", 0) >= 0 &&
+				sceHttpAddRequestHeader(request.request, "Content-Type",
+					content_type ? content_type : "application/x-www-form-urlencoded", 0) >= 0) :
+			(sceHttpAddRequestHeader(request.request, "User-Agent", user_agent, 0) >= 0 &&
+				sceHttpAddRequestHeader(request.request, "Accept", "application/vnd.github+json", 0) >= 0 &&
+				sceHttpAddRequestHeader(request.request, "X-GitHub-Api-Version", "2022-11-28", 0) >= 0);
+		if (!headers_ok)
+		{
+			ProbeLog("Native HTTPS: request headers unavailable\n");
+			return false;
+		}
+		const int result = sceHttpSendRequest(request.request, body_size ? body->data() : nullptr, body_size);
+		int http = 0;
+		const int status = result < 0 ? result : sceHttpGetStatusCode(request.request, &http);
+		ProbeLog("Native HTTPS: send=%#x status=%#x http=%d\n", result, status, http);
+		if (status < 0 || http != 200)
+			return false;
+		std::array<unsigned char, 4096> buffer{};
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+		for (;;)
+		{
+			if (std::chrono::steady_clock::now() > deadline)
+			{
+				sceHttpAbortRequest(request.request);
+				ProbeLog("Native HTTPS: transfer deadline exceeded\n");
+				return false;
+			}
+			const int count = sceHttpReadData(request.request, buffer.data(), buffer.size());
+			if (count < 0 || static_cast<size_t>(count) > buffer.size() || bytes.size() + static_cast<size_t>(count) > max_bytes)
+				return false;
+			if (count == 0)
+				break;
+			bytes.insert(bytes.end(), buffer.begin(), buffer.begin() + count);
+		}
+		ProbeLog("Native HTTPS: response bytes=%zu\n", bytes.size());
+		return true;
+	}
+} // namespace
+
 bool PS4CoverHttp::Get(const std::string& url, const char* user_agent, std::vector<unsigned char>& bytes,
 	size_t max_bytes)
 {
-	bytes.clear();
-	const int context = HttpContext();
-	if (context < 0 || url.empty() || !user_agent || max_bytes == 0)
-		return false;
-	Request request;
-	request.tmpl = sceHttpCreateTemplate(context, user_agent, ORBIS_HTTP_VERSION_1_1, 0);
-	ProbeLog("Native HTTPS: template=%#x url=%s\n", request.tmpl, url.c_str());
-	if (request.tmpl < 0)
-		return false;
-	for (int rc : {sceHttpsEnableOption(request.tmpl, 0xbd),
-		sceHttpSetResolveTimeOut(request.tmpl, 4000000),
-		sceHttpSetConnectTimeOut(request.tmpl, 4000000),
-		sceHttpSetSendTimeOut(request.tmpl, 4000000),
-		CoverHttpRecvTimeout(request.tmpl, 4000000),
-		CoverHttpAutoRedirect(request.tmpl, 0)})
-	{
-		if (rc < 0)
-		{
-			ProbeLog("Native HTTPS: setup failed=%#x url=%s\n", rc, url.c_str());
-			return false;
-		}
-	}
-	request.connection = sceHttpCreateConnectionWithURL(request.tmpl, url.c_str(), false);
-	if (request.connection < 0)
-		return false;
-	request.request = sceHttpCreateRequestWithURL(request.connection, ORBIS_METHOD_GET, url.c_str(), 0);
-	if (request.request < 0)
-		return false;
-	if (sceHttpAddRequestHeader(request.request, "User-Agent", user_agent, 0) < 0 ||
-		sceHttpAddRequestHeader(request.request, "Accept", "application/vnd.github+json", 0) < 0 ||
-		sceHttpAddRequestHeader(request.request, "X-GitHub-Api-Version", "2022-11-28", 0) < 0)
-	{
-		ProbeLog("Native HTTPS: request headers unavailable\n");
-		return false;
-	}
-	const int result = sceHttpSendRequest(request.request, nullptr, 0);
-	int http = 0;
-	const int status = result < 0 ? result : sceHttpGetStatusCode(request.request, &http);
-	ProbeLog("Native HTTPS: send=%#x status=%#x http=%d\n", result, status, http);
-	if (status < 0 || http != 200)
-		return false;
-	std::array<unsigned char, 4096> buffer{};
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
-	for (;;)
-	{
-		if (std::chrono::steady_clock::now() > deadline)
-		{
-			sceHttpAbortRequest(request.request);
-			ProbeLog("Native HTTPS: transfer deadline exceeded\n");
-			return false;
-		}
-		const int count = sceHttpReadData(request.request, buffer.data(), buffer.size());
-		if (count < 0 || static_cast<size_t>(count) > buffer.size() || bytes.size() + static_cast<size_t>(count) > max_bytes)
-			return false;
-		if (count == 0)
-			break;
-		bytes.insert(bytes.end(), buffer.begin(), buffer.begin() + count);
-	}
-	ProbeLog("Native HTTPS: response bytes=%zu\n", bytes.size());
-	return true;
+	return Send(HttpMethodGet, url, user_agent, nullptr, nullptr, bytes, max_bytes);
+}
+
+bool PS4CoverHttp::Post(const std::string& url, const char* user_agent, const std::string& body,
+	const char* content_type, std::vector<unsigned char>& bytes, size_t max_bytes)
+{
+	return Send(HttpMethodPost, url, user_agent, &body, content_type, bytes, max_bytes);
 }
 
 DiscCoverDownload::~DiscCoverDownload()

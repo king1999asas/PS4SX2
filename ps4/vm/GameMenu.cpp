@@ -4,6 +4,7 @@
 #include "InGameMenuState.h"
 #include "PhysicalDisc.h"
 #include "CoverDownload.h"
+#include "GameHackingCheats.h"
 #include "ReleaseCheck.h"
 #include "GameDatabase.h"
 #include "GameList.h"
@@ -35,6 +36,8 @@
 #include <dirent.h>
 #include <memory>
 #include <pthread.h>
+#include <set>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
@@ -920,7 +923,7 @@ namespace PS4GameMenu
 			Item search{searching ? "Buscando trucos en internet..." : "Buscar trucos en internet", CheatSearchPath, {}, false};
 			search.detail = searching ? "Buscando..." : "X: buscar";
 			search.help = "Busca trucos y mejoras para " + game.serial + " / " + CrcText(game.crc) +
-			              " en bases de datos públicas de PCSX2.";
+			              " en las bases de datos públicas de PCSX2 y en gamehacking.org.";
 			items.push_back(std::move(search));
 			const std::vector<std::string> enabled = LoadEnabledCheats(game.serial);
 			for (size_t i = 0; i < entries.size(); ++i)
@@ -1017,10 +1020,69 @@ namespace PS4GameMenu
 				}
 				return false;
 			}
+			// gamehacking.org: the site's export of all the game's codes, cleaned (see
+			// GameHackingCheats.h) and kept in its own file beside the GitHub one.
+			bool FetchGameHacking()
+			{
+				const PS4GameHacking::Entry* entry = PS4GameHacking::Find(m_game.serial, m_game.crc);
+				if (!entry)
+				{
+					ProbeLog("Cheats: gamehacking.org has no entry for %s\n", CheatFileStem(m_game).c_str());
+					return false;
+				}
+				std::vector<unsigned char> bytes;
+				const std::string body = PS4GameHacking::ExportBody(*entry, CheatFileStem(m_game));
+				if (!PS4CoverHttp::Post(PS4GameHacking::ExportUrl, "PS4SX2/1.00 cheat-search", body,
+						"application/x-www-form-urlencoded", bytes, 2 * 1024 * 1024))
+				{
+					ProbeLog("Cheats: gamehacking.org request failed for game %u\n", entry->game_id);
+					return false;
+				}
+				const std::string text(bytes.begin(), bytes.end());
+				if (text.find("patch=") == std::string::npos)
+				{
+					ProbeLog("Cheats: gamehacking.org answered without codes for game %u (%zu bytes)\n", entry->game_id,
+						text.size());
+					return false;
+				}
+				// Names in the other cheat file of this game, which PCSX2 loads too.
+				std::set<std::string> taken;
+				const std::string other = std::string(CheatsDirectory) + "/" + CheatFileStem(m_game) + "_internet.pnach";
+				if (FILE* file = std::fopen(other.c_str(), "rb"))
+				{
+					std::string existing;
+					char chunk[4096];
+					size_t read = 0;
+					while ((read = std::fread(chunk, 1, sizeof(chunk), file)) > 0 && existing.size() < (4u << 20))
+						existing.append(chunk, read);
+					std::fclose(file);
+					taken = PS4GameHacking::SectionNames(existing);
+				}
+				const std::string title = m_game.title.empty() ? m_game.serial : m_game.title;
+				const PS4GameHacking::CleanResult clean = PS4GameHacking::Clean(text, title, taken);
+				ProbeLog("Cheats: gamehacking.org game %u: %u codes kept, %u left out (malformed or master codes)\n",
+					entry->game_id, clean.kept, clean.dropped);
+				if (!clean.kept)
+					return false;
+				mkdir(CheatsDirectory, 0777);
+				const std::string path = std::string(CheatsDirectory) + "/" + CheatFileStem(m_game) + "_gamehacking.pnach";
+				FILE* file = std::fopen(path.c_str(), "wb");
+				if (!file)
+					return false;
+				std::fprintf(file, "// Descargado automáticamente por PS4SX2 de gamehacking.org (juego %u).\n"
+				                   "// Solo códigos completos; se quitaron %u mal convertidos o códigos maestros.\n",
+					entry->game_id, clean.dropped);
+				std::fwrite(clean.pnach.data(), 1, clean.pnach.size(), file);
+				std::fclose(file);
+				ProbeLog("Cheats: saved %s (%zu bytes)\n", path.c_str(), clean.pnach.size());
+				return true;
+			}
 			void Run()
 			{
 				pthread_setname_np(pthread_self(), "PS4 cheat fetch");
 				m_found_cheats = Fetch(CheatSources, std::size(CheatSources), CheatsDirectory);
+				if (!m_cancel.load() && FetchGameHacking())
+					m_found_cheats = true;
 				m_found_patches = Fetch(PatchSources, std::size(PatchSources), PatchesDirectory);
 				if (m_cancel.load())
 					return;

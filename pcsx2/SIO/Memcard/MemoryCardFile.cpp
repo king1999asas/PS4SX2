@@ -24,6 +24,8 @@
 
 #include "fmt/format.h"
 
+#include <algorithm>
+#include <cstring>
 #include <map>
 
 #include <atomic>
@@ -399,7 +401,10 @@ void FileMemoryCard::Open()
 			m_cache_ok[slot] = !m_ispsx[slot] && !OrbisFlag("mcd_nocache");
 			#endif
 			if (m_cache_ok[slot] && FileMcd_IsMemoryCardFormatted(m_file[slot]))
-				LoadCache(slot);
+			{
+				if (LoadCache(slot))
+					LogCardContents(slot, m_cache[slot], "start");
+			}
 			else
 				std::printf("[mcd] slot %d: %s\n", slot,
 					!m_cache_ok[slot] ? (m_ispsx[slot] ? "PS1 card, not cached" : "mcd_nocache: not cached") :
@@ -436,6 +441,193 @@ bool FileMemoryCard::LoadCache(uint slot)
 		std::string(Path::GetFileName(m_filenames[slot])).c_str(), static_cast<long long>(size),
 		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count());
 	return true;
+}
+
+// PS4 port: what the card holds, read from its RAM image (the PS2 memory card file
+// system: superblock, indirect FAT, directory entries). Logged when the game starts
+// and when it closes, so a session log shows the free space and every save with its
+// size and date, and flags a save whose cluster chain is broken.
+static void LogCardContents(uint slot, const std::vector<u8>& image, const char* when)
+{
+	static constexpr char Magic[] = "Sony PS2 Memory Card Format ";
+	if (image.size() < 0x200 || std::memcmp(image.data(), Magic, sizeof(Magic) - 1) != 0)
+	{
+		std::printf("[mcd] card %u (%s): no PS2 file system\n", slot, when);
+		return;
+	}
+	const auto rd16 = [](const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8)); };
+	const auto rd32 = [](const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<u32>(p[3]) << 24)); };
+	const u8* sb = image.data();
+	const u32 page_len = rd16(sb + 0x28), ppc = rd16(sb + 0x2A), clusters = rd32(sb + 0x30);
+	const u32 alloc_offset = rd32(sb + 0x34), alloc_end = rd32(sb + 0x38), root = rd32(sb + 0x3C);
+	if (page_len == 0 || page_len > 2048 || ppc == 0 || ppc > 16 || clusters == 0 || alloc_end == 0 || alloc_end > clusters)
+	{
+		std::printf("[mcd] card %u (%s): superblock not valid (page %u, cluster %u pages, %u clusters, end %u)\n", slot, when,
+			page_len, ppc, clusters, alloc_end);
+		return;
+	}
+	const size_t raw_page = image.size() >= static_cast<size_t>(clusters) * ppc * (page_len + 16) ? page_len + 16 : page_len;
+	const u32 cluster_size = page_len * ppc, per_cluster = cluster_size / 4;
+	std::vector<u8> buffer(cluster_size);
+	u32 buffer_cluster = ~0u;
+	const auto read_cluster = [&](u32 absolute) -> const u8* {
+		if (absolute == buffer_cluster)
+			return buffer.data();
+		for (u32 p = 0; p < ppc; p++)
+		{
+			const size_t offset = (static_cast<size_t>(absolute) * ppc + p) * raw_page;
+			if (offset + page_len > image.size())
+				return nullptr;
+			std::memcpy(&buffer[p * page_len], &image[offset], page_len);
+		}
+		buffer_cluster = absolute;
+		return buffer.data();
+	};
+	// FAT entry of a cluster relative to alloc_offset: bit 31 = in use, 0xFFFFFFFF = last one.
+	const auto fat = [&](u32 relative, u32* out) -> bool {
+		const u32 fat_index = relative / per_cluster, indirect_index = fat_index / per_cluster;
+		if (indirect_index >= 32)
+			return false;
+		const u8* ifc = read_cluster(rd32(sb + 0x50 + indirect_index * 4));
+		if (!ifc)
+			return false;
+		const u32 fat_cluster = rd32(ifc + (fat_index % per_cluster) * 4);
+		const u8* table = read_cluster(fat_cluster);
+		if (!table)
+			return false;
+		*out = rd32(table + (relative % per_cluster) * 4);
+		return true;
+	};
+	u32 free_clusters = 0;
+	bool fat_ok = true;
+	for (u32 c = 0; c < alloc_end && fat_ok; c++)
+	{
+		u32 e = 0;
+		fat_ok = fat(c, &e);
+		free_clusters += fat_ok && !(e & 0x80000000u);
+	}
+	// A file's clusters, following the FAT from its first one.
+	const auto chain = [&](u32 start, std::vector<u32>* out) -> bool {
+		out->clear();
+		u32 c = start;
+		while (out->size() <= alloc_end)
+		{
+			if (c >= alloc_end)
+				return false;
+			out->push_back(c);
+			u32 e = 0;
+			if (!fat(c, &e) || !(e & 0x80000000u))
+				return false;
+			if (e == 0xFFFFFFFFu)
+				return true;
+			c = e & 0x7FFFFFFFu;
+		}
+		return false; // a loop
+	};
+	struct DirEntry
+	{
+		u32 mode = 0, length = 0, cluster = 0;
+		u8 modified[8] = {};
+		char name[33] = {};
+	};
+	const auto entry_at = [&](const std::vector<u32>& clusters_of_dir, u32 index, DirEntry* out) -> bool {
+		const u32 byte = index * 512;
+		if (byte / cluster_size >= clusters_of_dir.size())
+			return false;
+		const u8* data = read_cluster(alloc_offset + clusters_of_dir[byte / cluster_size]);
+		if (!data)
+			return false;
+		const u8* e = data + byte % cluster_size;
+		out->mode = rd16(e);
+		out->length = rd32(e + 4);
+		out->cluster = rd32(e + 0x10);
+		std::memcpy(out->modified, e + 0x18, 8);
+		std::memcpy(out->name, e + 0x40, 32);
+		out->name[32] = 0;
+		for (char* c = out->name; *c; c++)
+			if (static_cast<u8>(*c) < 0x20 || static_cast<u8>(*c) > 0x7e)
+				*c = '?';
+		return true;
+	};
+	std::vector<u32> root_clusters;
+	DirEntry dot;
+	if (!chain(root, &root_clusters) || !entry_at(root_clusters, 0, &dot))
+	{
+		std::printf("[mcd] card %u (%s): root directory unreadable (cluster %u)\n", slot, when, root);
+		return;
+	}
+	struct Save
+	{
+		DirEntry dir;
+		u32 files = 0, bytes = 0, broken = 0;
+		std::string first_broken;
+	};
+	std::vector<Save> saves;
+	u32 bad_root = 0;
+	for (u32 i = 2; i < dot.length && i < 4096; i++)
+	{
+		Save save;
+		if (!entry_at(root_clusters, i, &save.dir))
+		{
+			bad_root++;
+			break;
+		}
+		if (!(save.dir.mode & 0x8000) || !(save.dir.mode & 0x20))
+			continue;
+		std::vector<u32> dir_clusters, file_clusters;
+		if (!chain(save.dir.cluster, &dir_clusters))
+		{
+			save.broken++;
+			save.first_broken = "(its directory)";
+		}
+		else
+		{
+			for (u32 j = 2; j < save.dir.length && j < 512; j++)
+			{
+				DirEntry file;
+				if (!entry_at(dir_clusters, j, &file))
+				{
+					save.broken++;
+					if (save.first_broken.empty())
+						save.first_broken = "(its directory)";
+					break;
+				}
+				if (!(file.mode & 0x8000) || !(file.mode & 0x10))
+					continue;
+				save.files++;
+				save.bytes += file.length;
+				const u32 needed = (file.length + cluster_size - 1) / cluster_size;
+				if (needed && (!chain(file.cluster, &file_clusters) || file_clusters.size() < needed))
+				{
+					save.broken++;
+					if (save.first_broken.empty())
+						save.first_broken = file.name;
+				}
+			}
+		}
+		saves.push_back(std::move(save));
+	}
+	std::printf("[mcd] card %u (%s): %u KiB free of %u KiB, %zu save(s)%s%s\n", slot, when,
+		free_clusters * cluster_size / 1024, alloc_end * cluster_size / 1024, saves.size(),
+		fat_ok ? "" : ", FAT unreadable", bad_root ? ", root directory cut short" : "");
+	// Newest first.
+	const auto when_key = [&](const Save& save) {
+		const u8* t = save.dir.modified;
+		return (static_cast<u64>(rd16(t + 6)) << 40) | (static_cast<u64>(t[5]) << 32) | (static_cast<u64>(t[4]) << 24) |
+		       (static_cast<u64>(t[3]) << 16) | (static_cast<u64>(t[2]) << 8) | t[1];
+	};
+	std::sort(saves.begin(), saves.end(), [&](const Save& a, const Save& b) { return when_key(a) > when_key(b); });
+	for (size_t i = 0; i < saves.size() && i < 64; i++)
+	{
+		const Save& save = saves[i];
+		const u8* t = save.dir.modified; // PS2 time (JST): sec, min, hour, day, month, year
+		std::printf("[mcd]   %-32s %2u file(s) %5u KiB  %04u-%02u-%02u %02u:%02u%s%s\n", save.dir.name, save.files,
+			(save.bytes + 1023) / 1024, rd16(t + 6), t[5], t[4], t[3], t[2], save.broken ? "  BROKEN: " : "",
+			save.broken ? save.first_broken.c_str() : "");
+	}
+	if (saves.size() > 64)
+		std::printf("[mcd]   ... %zu more\n", saves.size() - 64);
+	std::fflush(stdout);
 }
 
 void FileMemoryCard::MarkDirty(uint slot, u32 adr, u32 size)
@@ -552,6 +744,8 @@ void FileMemoryCard::Close()
 			m_io_stats[slot].erase_failures, m_io_stats[slot].flush_calls, m_io_stats[slot].flush_failures, dirty_blocks);
 		if (!cache_flushed)
 			Console.Error("[mcd] slot %u: checksum sector left unchanged because dirty data did not flush", slot);
+		if (!m_cache[slot].empty())
+			LogCardContents(slot, m_cache[slot], "end");
 		m_cache[slot] = {};
 		m_dirty[slot] = {};
 		m_cache_ok[slot] = false;

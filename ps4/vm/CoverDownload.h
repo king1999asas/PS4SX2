@@ -13,6 +13,9 @@ namespace PS4CoverHttp
 {
 	bool Get(const std::string& url, const char* user_agent, std::vector<unsigned char>& bytes,
 		size_t max_bytes);
+	// Form POST (body already URL-encoded); same limits and logging as Get.
+	bool Post(const std::string& url, const char* user_agent, const std::string& body, const char* content_type,
+		std::vector<unsigned char>& bytes, size_t max_bytes);
 }
 
 // (AI-assisted) One menu-owned request; no detached work or GPU access.
