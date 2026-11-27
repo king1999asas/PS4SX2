@@ -1399,14 +1399,46 @@ static void RunQuickStateRequest()
 		return;
 	}
 
+	// Return point: PCSX2 resets the game when a state fails half-way through
+	// loading (a damaged file, or one from an incompatible build). Saving the
+	// current moment first means a failed load puts the player back here
+	// instead, so nothing played since the last save is lost.
+	const std::string undo_path = EmuFolders::Savestates + "/quickload-undo.p2s";
+	bool undo_failed = false;
+	std::string undo_failure;
+	VMManager::SaveState(undo_path.c_str(), false, false, [&undo_failed, &undo_failure](const std::string& message) {
+		undo_failed = true;
+		undo_failure = message;
+	});
+	const bool have_undo = !undo_failed && FileSystem::FileExists(undo_path.c_str());
+	if (!have_undo)
+	{
+		// Without a return point a failed load could cost the current game, so do not try.
+		ProbeLog("Quick load: return point FAILED after %.0f ms (%s); load cancelled\n", elapsed_ms(), undo_failure.c_str());
+		SetQuickRowLine(QuickStateLoad, "No se pudo crear el punto de retorno, así que no se ha cargado: " + undo_failure,
+			PS4GameMenu::InGameToneError);
+		return;
+	}
+	ProbeLog("Quick load: return point written to %s in %.0f ms\n", undo_path.c_str(), elapsed_ms());
+
 	Error error;
 	if (!VMManager::LoadStateFromSlot(QUICK_STATE_SLOT, false, &error))
 	{
-		ProbeLog("Quick load: slot %d FAILED after %.0f ms: %s\n", QUICK_STATE_SLOT, elapsed_ms(),
-			error.GetDescription().c_str());
-		SetQuickRowLine(QuickStateLoad, "No se pudo cargar: " + error.GetDescription(), PS4GameMenu::InGameToneError);
+		const std::string reason = error.GetDescription();
+		ProbeLog("Quick load: slot %d FAILED after %.0f ms: %s\n", QUICK_STATE_SLOT, elapsed_ms(), reason.c_str());
+		Error undo_error;
+		const bool restored = VMManager::LoadState(undo_path.c_str(), &undo_error);
+		ProbeLog("Quick load: return point %s%s%s\n", restored ? "restored" : "FAILED to restore: ",
+			restored ? "" : undo_error.GetDescription().c_str(), restored ? "; game is where it was" : "");
+		const bool other_build = reason.find("version") != std::string::npos ||
+			reason.find("Not an Orbis save state") != std::string::npos;
+		std::string line = other_build ? "Ese guardado rápido es de una versión del emulador incompatible" :
+										 "No se pudo cargar: " + reason;
+		line += restored ? ". La partida sigue donde estaba" : ". Tampoco se pudo volver al punto de partida";
+		SetQuickRowLine(QuickStateLoad, std::move(line), PS4GameMenu::InGameToneError);
 		return;
 	}
+	FileSystem::DeleteFilePath(undo_path.c_str());
 	ProbeLog("Quick load: slot %d loaded from %s in %.0f ms; resuming\n", QUICK_STATE_SLOT, path.c_str(), elapsed_ms());
 	// The guest clock jumped to the saved cycle count; restart the per-second
 	// counters from it instead of reporting one bogus interval.
