@@ -337,6 +337,173 @@ static void McdEccChunk(const u8* data, u8 out[3])
 	out[2] = static_cast<u8>(line1);
 }
 
+// PS4 port: files whose cluster chain is broken, left by a save cut short (MCMAN had
+// linked the icon's next cluster in the FAT but never wrote that cluster's own entry).
+// MCMAN follows the chain to delete a file and gives up at the break, so the BIOS can
+// neither delete nor overwrite such a save. The chain is ended at its last valid cluster,
+// as a disk check would, and the file's length is cut to what that chain holds (a file
+// whose first cluster is already free becomes empty). Each changed page gets its ECC
+// computed again (the same Hamming code PCSX2's folder memory cards write). Returns how
+// many files were repaired, appends their names to `report`, and the offsets of the
+// pages changed to `changed`.
+static u32 RepairBrokenChains(std::vector<u8>& image, std::vector<u32>* changed, std::string* report)
+{
+	static constexpr char Magic[] = "Sony PS2 Memory Card Format ";
+	if (image.size() < 0x200 || std::memcmp(image.data(), Magic, sizeof(Magic) - 1) != 0)
+		return 0;
+	const auto rd16 = [](const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8)); };
+	const auto rd32 = [](const u8* p) { return static_cast<u32>(p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<u32>(p[3]) << 24)); };
+	const u8* sb = image.data();
+	const u32 page_len = rd16(sb + 0x28), ppc = rd16(sb + 0x2A), clusters = rd32(sb + 0x30);
+	const u32 alloc_offset = rd32(sb + 0x34), alloc_end = rd32(sb + 0x38), root = rd32(sb + 0x3C);
+	const u8 card_flags = sb[0x151];
+	if (page_len != 512 || ppc == 0 || ppc > 16 || clusters == 0 || alloc_end == 0 || alloc_offset + alloc_end > clusters ||
+		!(card_flags & 0x01))
+		return 0;
+	const size_t raw_page = page_len + 16;
+	if (image.size() < static_cast<size_t>(clusters) * ppc * raw_page)
+		return 0;
+	const u32 cluster_size = page_len * ppc, per_cluster = cluster_size / 4;
+	// Where a 32-bit word of an absolute cluster lives: page and byte within the page.
+	struct Where
+	{
+		u32 page = ~0u, byte = 0;
+	};
+	const auto locate = [&](u32 cluster, u32 index) -> Where {
+		const u32 byte = index * 4, page = cluster * ppc + byte / page_len;
+		if (cluster >= clusters || static_cast<size_t>(page + 1) * raw_page > image.size())
+			return {};
+		return {page, byte % page_len};
+	};
+	const auto read_at = [&](const Where& w) { return rd32(&image[static_cast<size_t>(w.page) * raw_page + w.byte]); };
+	const auto write_at = [&](const Where& w, u32 value) {
+		u8* page = &image[static_cast<size_t>(w.page) * raw_page];
+		page[w.byte] = static_cast<u8>(value);
+		page[w.byte + 1] = static_cast<u8>(value >> 8);
+		page[w.byte + 2] = static_cast<u8>(value >> 16);
+		page[w.byte + 3] = static_cast<u8>(value >> 24);
+		for (u32 chunk = 0; chunk < page_len / 128; chunk++)
+			McdEccChunk(page + chunk * 128, page + page_len + chunk * 3);
+		const u32 offset = static_cast<u32>(static_cast<size_t>(w.page) * raw_page);
+		if (changed && std::find(changed->begin(), changed->end(), offset) == changed->end())
+			changed->push_back(offset);
+	};
+	std::vector<Where> fat_where(alloc_end);
+	for (u32 c = 0; c < alloc_end; c++)
+	{
+		const u32 fat_index = c / per_cluster, indirect_index = fat_index / per_cluster;
+		if (indirect_index >= 32)
+			return 0;
+		const Where ifc = locate(rd32(sb + 0x50 + indirect_index * 4), fat_index % per_cluster);
+		if (ifc.page == ~0u)
+			return 0;
+		fat_where[c] = locate(read_at(ifc), c % per_cluster);
+		if (fat_where[c].page == ~0u)
+			return 0;
+	}
+	const auto fat = [&](u32 c) { return read_at(fat_where[c]); };
+	// A chain up to its end or break. ok: it ends with 0xFFFFFFFF; otherwise `list` holds the
+	// clusters before the break.
+	const auto chain = [&](u32 start, std::vector<u32>* list) -> bool {
+		list->clear();
+		std::vector<u8> seen;
+		u32 c = start;
+		while (c < alloc_end && list->size() <= alloc_end)
+		{
+			const u32 e = fat(c);
+			if (!(e & 0x80000000u))
+				return false; // c itself is free: the chain broke before it
+			if (seen.empty())
+				seen.assign(alloc_end, 0);
+			if (seen[c])
+				return false; // a loop
+			seen[c] = 1;
+			list->push_back(c);
+			if (e == 0xFFFFFFFFu)
+				return true;
+			c = e & 0x7FFFFFFFu;
+		}
+		return false; // out of range
+	};
+	u32 repaired = 0;
+	std::vector<u32> dir, files;
+	struct Pending
+	{
+		u32 cluster, depth;
+		std::string path;
+	};
+	std::vector<Pending> pending{{root, 0, {}}};
+	std::vector<u8> visited(alloc_end, 0);
+	while (!pending.empty())
+	{
+		const Pending d = pending.back();
+		pending.pop_back();
+		if (d.depth > 8 || d.cluster >= alloc_end || visited[d.cluster])
+			continue;
+		visited[d.cluster] = 1;
+		chain(d.cluster, &dir); // a broken directory chain: only the entries it reaches are checked
+		const auto entry = [&](u32 index, u32 offset) -> Where {
+			const u32 byte = index * 512 + offset;
+			if (byte / cluster_size >= dir.size())
+				return {};
+			return locate(alloc_offset + dir[byte / cluster_size], (byte % cluster_size) / 4);
+		};
+		const Where count_at = entry(0, 4);
+		if (count_at.page == ~0u)
+			continue;
+		const u32 entries = std::min<u32>(read_at(count_at), 65536);
+		for (u32 i = 2; i < entries; i++)
+		{
+			const Where mode_at = entry(i, 0), length_at = entry(i, 4), first_at = entry(i, 0x10), name_at = entry(i, 0x40);
+			if (mode_at.page == ~0u || length_at.page == ~0u || first_at.page == ~0u || name_at.page == ~0u)
+				break;
+			const u32 mode = read_at(mode_at) & 0xFFFF;
+			if (!(mode & 0x8000))
+				continue;
+			char name[33] = {};
+			std::memcpy(name, &image[static_cast<size_t>(name_at.page) * raw_page + name_at.byte], 32);
+			for (char* c = name; *c; c++)
+				if (static_cast<u8>(*c) < 0x20 || static_cast<u8>(*c) > 0x7e)
+					*c = '?';
+			const std::string path = d.path.empty() ? std::string(name) : d.path + "/" + name;
+			const u32 first = read_at(first_at);
+			if (mode & 0x20)
+			{
+				pending.push_back({first, d.depth + 1, path});
+				continue;
+			}
+			if (!(mode & 0x10))
+				continue;
+			const u32 length = read_at(length_at);
+			if (first >= alloc_end)
+				continue; // no clusters (an empty file): nothing to follow
+			const bool ok = chain(first, &files);
+			const u32 needed = (length + cluster_size - 1) / cluster_size;
+			if (ok && files.size() >= needed)
+				continue;
+			u32 new_length = 0;
+			if (files.empty())
+			{
+				write_at(first_at, 0xFFFFFFFFu);
+				write_at(length_at, 0);
+			}
+			else
+			{
+				if (!ok)
+					write_at(fat_where[files.back()], 0xFFFFFFFFu);
+				new_length = std::min<u32>(length, static_cast<u32>(files.size()) * cluster_size);
+				if (new_length != length)
+					write_at(length_at, new_length);
+			}
+			repaired++;
+			if (report && report->size() < 1024)
+				*report += (report->empty() ? "" : ", ") + path + " (" + std::to_string(length) + " -> " + std::to_string(new_length) +
+						   " bytes)";
+		}
+	}
+	return repaired;
+}
+
 // PS4 port: pages MCMAN would reject in clusters no file uses. MCMAN reads every page of
 // an erase block before it rewrites the block, and gives up on a page whose ECC does not
 // match after five reads: a new save that needs such a block then fails ("error al
@@ -626,17 +793,23 @@ bool FileMemoryCard::LoadCache(uint slot)
 	m_dirty_any[slot] = false;
 	{
 		std::vector<u32> changed;
+		std::string broken;
+		const u32 cut = RepairBrokenChains(m_cache[slot], &changed, &broken);
+		if (cut)
+			std::printf("[mcd] slot %u: %u file(s) with a broken cluster chain, ended at their last valid cluster: %s\n", slot, cut,
+				broken.c_str());
+		const size_t chain_pages = changed.size();
 		u32 orphans = 0;
 		const u32 reset = RepairFreeClusterPages(m_cache[slot], &changed, &orphans);
 		if (orphans)
 			std::printf("[mcd] slot %u: %u cluster(s) marked in use belong to no file (left by saves cut short)\n", slot, orphans);
+		for (const u32 offset : changed)
+			MarkDirty(slot, offset, 528);
 		if (reset)
 		{
-			for (const u32 offset : changed)
-				MarkDirty(slot, offset, 528);
 			std::printf("[mcd] slot %u: %u page(s) in clusters no file uses were neither erased nor ECC-consistent; set to erased "
 						"(first at byte 0x%X, page 0x%X)\n",
-				slot, reset, changed.front(), changed.front() / 528);
+				slot, reset, changed[chain_pages], changed[chain_pages] / 528);
 		}
 		else
 			std::printf("[mcd] slot %u: no unusable pages in clusters no file uses\n", slot);
