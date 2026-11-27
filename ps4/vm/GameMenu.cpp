@@ -153,6 +153,12 @@ namespace PS4GameMenu
 		// One atomic snapshot shared by CPU and GS; field widths are defined
 		// in InGameMenuState.h so publication and rendering stay consistent.
 		std::atomic<unsigned> s_in_game_state{0};
+		// Quick save/load status lines. GS thread only: the CPU thread changes
+		// them through RunOnGSThread (SetInGameQuickStateText).
+		std::string s_quick_save_text;
+		std::string s_quick_load_text;
+		unsigned s_quick_save_tone = 0;
+		unsigned s_quick_load_tone = 0;
 		std::string s_status;
 		std::vector<CoverTexture> s_cover_textures;
 		std::vector<UiImage> s_ui_images;
@@ -2095,51 +2101,90 @@ namespace PS4GameMenu
 			draw->AddRectFilled(point(64, 38), point(1856, 170), IM_COL32(4, 19, 34, 205), 24.0f * scale);
 			draw->AddLine(point(64, 170), point(1856, 170), IM_COL32(38, 103, 157, 150), 1.0f * scale);
 			image("status_controle", 126, 82, 40, 34);
-			draw->AddText(font, 34.0f * scale, point(196, 82), white, "Emulator menu");
-			draw->AddText(font, 18.0f * scale, point(138, 205), muted, "GAME PAUSED");
+			draw->AddText(font, 34.0f * scale, point(196, 82), white, "Menú del emulador");
+			draw->AddText(font, 18.0f * scale, point(138, 177), muted, "JUEGO EN PAUSA");
 			char resolution[96];
-			std::snprintf(resolution, sizeof(resolution), "Internal resolution:  < %ux >%s", upscale,
-				upscale == 1 ? "  (native, recomendado)" : "  (baja los FPS)");
-			static constexpr const char* aspect_names[] = {"Stretch", "Auto", "4:3", "16:9", "10:7"};
+			std::snprintf(resolution, sizeof(resolution), "Resolución interna:  < %ux >%s", upscale,
+				upscale == 1 ? "  (nativa, recomendado)" : "  (baja los FPS)");
+			static constexpr const char* aspect_names[] = {"Estirar", "Auto", "4:3", "16:9", "10:7"};
 			char aspect_label[96];
-			std::snprintf(aspect_label, sizeof(aspect_label), "Aspect ratio:  < %s >", aspect_names[std::min(aspect, 4u)]);
+			std::snprintf(aspect_label, sizeof(aspect_label), "Formato de imagen:  < %s >", aspect_names[std::min(aspect, 4u)]);
 			char performance_label[96];
-			std::snprintf(performance_label, sizeof(performance_label), "Performance overlay:  < %s >",
-				show_performance_overlay ? "On" : "Off");
-			const char* labels[] = {"Resume game", resolution, aspect_label, performance_label, "Return to main menu", "Exit application"};
-			const char* descriptions[] = {
-				"Continue emulation from the current frame",
-				"Increase internal rendering quality for this session",
-				"Choose the display shape used by the GS renderer",
-				"Show or hide FPS, speed and timing indicators; L1 captures VU1 code",
-				"Close the VM and reopen the PS4SX2 game library",
-				"Close the VM and exit PS4SX2"};
+			std::snprintf(performance_label, sizeof(performance_label), "Datos de rendimiento:  < %s >",
+				show_performance_overlay ? "Sí" : "No");
+			const char* labels[InGameRowCount] = {};
+			const char* descriptions[InGameRowCount] = {};
+			ImU32 description_colors[InGameRowCount];
+			for (ImU32& color : description_colors)
+				color = muted;
+			const auto tone_color = [&](unsigned tone) {
+				return tone == InGameToneBusy ? IM_COL32(255, 214, 102, 255) :
+					tone == InGameToneGood ? IM_COL32(112, 230, 140, 255) :
+					tone == InGameToneError ? IM_COL32(255, 120, 110, 255) : muted;
+			};
+			labels[InGameRowResume] = "Continuar";
+			descriptions[InGameRowResume] = "Sigue jugando desde este mismo momento";
+			labels[InGameRowQuickSave] = "Guardado rápido";
+			descriptions[InGameRowQuickSave] = s_quick_save_text.empty() ?
+				"Guarda la partida en este punto exacto (aparte de la memory card)" : s_quick_save_text.c_str();
+			description_colors[InGameRowQuickSave] = tone_color(s_quick_save_tone);
+			labels[InGameRowQuickLoad] = "Carga rápida";
+			descriptions[InGameRowQuickLoad] = s_quick_load_text.empty() ?
+				"Vuelve al último guardado rápido de este juego" : s_quick_load_text.c_str();
+			description_colors[InGameRowQuickLoad] = tone_color(s_quick_load_tone);
+			labels[InGameRowResolution] = resolution;
+			descriptions[InGameRowResolution] = "Calidad de imagen interna solo para esta partida";
+			labels[InGameRowAspect] = aspect_label;
+			descriptions[InGameRowAspect] = "Forma de la imagen en pantalla";
+			labels[InGameRowOverlay] = performance_label;
+			descriptions[InGameRowOverlay] = "Muestra u oculta FPS, velocidad y tiempos; L1 captura el código VU1";
+			labels[InGameRowMainMenu] = "Volver a la biblioteca";
+			descriptions[InGameRowMainMenu] = "Cierra el juego y vuelve a la lista de juegos de PS4SX2";
+			labels[InGameRowExit] = "Salir de PS4SX2";
+			descriptions[InGameRowExit] = "Cierra el juego y sale de la aplicación";
 			const auto draw_option_icon = [&](unsigned row, float cx, float cy, bool selected) {
 				const ImU32 icon_bg = selected ? IM_COL32(34, 127, 214, 255) : IM_COL32(16, 55, 86, 255);
 				const ImU32 icon_line = selected ? IM_COL32(231, 247, 255, 255) : IM_COL32(155, 204, 235, 255);
-				draw->AddCircleFilled(point(cx, cy), 29.0f * scale, icon_bg, 32);
-				draw->AddCircle(point(cx, cy), 29.0f * scale, selected ? accent : IM_COL32(49, 111, 155, 255), 32, 1.5f * scale);
-				if (row == 0)
+				draw->AddCircleFilled(point(cx, cy), 27.0f * scale, icon_bg, 32);
+				draw->AddCircle(point(cx, cy), 27.0f * scale, selected ? accent : IM_COL32(49, 111, 155, 255), 32, 1.5f * scale);
+				if (row == InGameRowResume)
 				{
 					draw->AddTriangleFilled(point(cx - 7, cy - 11), point(cx - 7, cy + 11), point(cx + 13, cy), icon_line);
 				}
-				else if (row == 1)
+				else if (row == InGameRowQuickSave || row == InGameRowQuickLoad)
+				{
+					// A tray with an arrow going into it (save) or out of it (load).
+					draw->AddLine(point(cx - 13, cy + 12), point(cx + 13, cy + 12), icon_line, 2.5f * scale);
+					draw->AddLine(point(cx - 13, cy + 4), point(cx - 13, cy + 12), icon_line, 2.5f * scale);
+					draw->AddLine(point(cx + 13, cy + 4), point(cx + 13, cy + 12), icon_line, 2.5f * scale);
+					if (row == InGameRowQuickSave)
+					{
+						draw->AddLine(point(cx, cy - 14), point(cx, cy + 1), icon_line, 3.0f * scale);
+						draw->AddTriangleFilled(point(cx - 7, cy - 2), point(cx + 7, cy - 2), point(cx, cy + 7), icon_line);
+					}
+					else
+					{
+						draw->AddLine(point(cx, cy + 7), point(cx, cy - 7), icon_line, 3.0f * scale);
+						draw->AddTriangleFilled(point(cx - 7, cy - 6), point(cx + 7, cy - 6), point(cx, cy - 15), icon_line);
+					}
+				}
+				else if (row == InGameRowResolution)
 				{
 					draw->AddRect(point(cx - 13, cy - 13), point(cx + 13, cy + 13), icon_line, 3 * scale, 2 * scale, 0);
 					draw->AddLine(point(cx - 7, cy + 6), point(cx + 7, cy + 6), icon_line, 2 * scale);
 				}
-				else if (row == 2)
+				else if (row == InGameRowAspect)
 				{
 					draw->AddRect(point(cx - 15, cy - 10), point(cx + 15, cy + 10), icon_line, 3 * scale, 2 * scale, 0);
 					draw->AddLine(point(cx - 8, cy - 15), point(cx + 8, cy - 15), icon_line, 2 * scale);
 				}
-				else if (row == 3)
+				else if (row == InGameRowOverlay)
 				{
 					draw->AddRect(point(cx - 15, cy - 9), point(cx + 15, cy + 9), icon_line, 3 * scale, 2 * scale, 0);
 					draw->AddLine(point(cx - 9, cy), point(cx + 9, cy), icon_line, 2 * scale);
 					draw->AddCircle(point(cx, cy), 4 * scale, icon_line, 16, 2 * scale);
 				}
-				else if (row == 4)
+				else if (row == InGameRowMainMenu)
 				{
 					draw->AddLine(point(cx - 12, cy), point(cx + 10, cy), icon_line, 3 * scale);
 					draw->AddLine(point(cx - 12, cy), point(cx - 2, cy - 9), icon_line, 3 * scale);
@@ -2151,31 +2196,36 @@ namespace PS4GameMenu
 					draw->AddLine(point(cx + 10, cy - 12), point(cx - 10, cy + 12), icon_line, 3 * scale);
 				}
 			};
-			for (unsigned row = 0; row < 6; row++)
+			// Eight rows: 76 px apart, 72 px tall, from y=204 to y=808.
+			for (unsigned row = 0; row < InGameRowCount; row++)
 			{
-				const float y = 206.0f + row * 84.0f;
+				const float y = 204.0f + row * 76.0f;
 				const bool selected = selected_row == row;
-				draw->AddRectFilled(point(112, y), point(1808, y + 82),
+				draw->AddRectFilled(point(112, y), point(1808, y + 72),
 					selected ? IM_COL32(20, 77, 125, 255) : IM_COL32(11, 33, 52, 255), 10.0f * scale);
 				if (selected)
-					draw->AddRect(point(112, y), point(1808, y + 82), accent, 10.0f * scale, 2.0f * scale, 0);
-				draw_option_icon(row, 168, y + 41, selected);
-				draw->AddText(font, 26.0f * scale, point(226, y + 19), white, labels[row]);
-				draw->AddText(font, 16.0f * scale, point(226, y + 53), muted, descriptions[row]);
-				if (row == 1 || row == 2 || row == 3)
-					draw->AddText(font, 20.0f * scale, point(1580, y + 29), selected ? white : muted,
-						row == 1 ? "ADJUST" : (row == 2 ? "SELECT" : "TOGGLE"));
+					draw->AddRect(point(112, y), point(1808, y + 72), accent, 10.0f * scale, 2.0f * scale, 0);
+				draw_option_icon(row, 168, y + 36, selected);
+				draw->AddText(font, 26.0f * scale, point(226, y + 12), white, labels[row]);
+				draw->AddText(font, 16.0f * scale, point(226, y + 46), description_colors[row], descriptions[row]);
+				const char* tag = row == InGameRowResolution ? "AJUSTAR" :
+					row == InGameRowAspect ? "ELEGIR" :
+					row == InGameRowOverlay ? "CAMBIAR" :
+					row == InGameRowQuickSave ? "GUARDAR" :
+					row == InGameRowQuickLoad ? "CARGAR" : nullptr;
+				if (tag)
+					draw->AddText(font, 20.0f * scale, point(1580, y + 25), selected ? white : muted, tag);
 			}
 			char hint[128];
-			std::snprintf(hint, sizeof(hint), "Left/Right: change value   |   Resolution range: 1x-%ux", max_upscale);
-		draw->AddText(font, 17.0f * scale, point(138, 756), muted, hint);
-		draw->AddText(font, 17.0f * scale, point(138, 786), muted, "1x recomendado en PS4 normal: 2x o más puede bajar mucho los FPS (3x-4x solo para PS4 Pro).");
-		draw->AddText(font, 17.0f * scale, point(138, 816), muted,
-			"Up/Down: select   Left/Right: change   X: confirm   L1 on overlay: capture VU1 code   Circle: resume");
-			image("controle_x", 1480, 904, 30, 30);
-			draw->AddText(font, 20.0f * scale, point(1524, 909), white, "Confirm");
-			image("controle_bola", 1690, 904, 30, 30);
-			draw->AddText(font, 20.0f * scale, point(1734, 909), muted, "Resume");
+			std::snprintf(hint, sizeof(hint), "Izquierda/Derecha: cambiar valor   |   Resolución: de 1x a %ux", max_upscale);
+			draw->AddText(font, 17.0f * scale, point(138, 832), muted, hint);
+			draw->AddText(font, 17.0f * scale, point(138, 858), muted, "1x recomendado en PS4 normal: 2x o más puede bajar mucho los FPS (3x-4x solo para PS4 Pro).");
+			draw->AddText(font, 17.0f * scale, point(138, 884), muted,
+				"Arriba/Abajo: elegir   Izquierda/Derecha: cambiar   X: aceptar   L1 en Datos de rendimiento: capturar VU1   Círculo: continuar");
+			image("controle_x", 1480, 950, 30, 30);
+			draw->AddText(font, 20.0f * scale, point(1524, 955), white, "Aceptar");
+			image("controle_bola", 1690, 950, 30, 30);
+			draw->AddText(font, 20.0f * scale, point(1734, 955), muted, "Continuar");
 			return true;
 		}
 		if (!s_visible || s_items.empty())
@@ -2453,6 +2503,17 @@ namespace PS4GameMenu
 		// so every value change is visible immediately in the panel.
 		MTGS::RunOnGSThread([]() {
 			GSPresentCurrentFrame();
+		});
+		MTGS::WaitGS(false);
+	}
+
+	void SetInGameQuickStateText(std::string save_text, unsigned save_tone, std::string load_text, unsigned load_tone)
+	{
+		MTGS::RunOnGSThread([save_text = std::move(save_text), save_tone, load_text = std::move(load_text), load_tone]() {
+			s_quick_save_text = save_text;
+			s_quick_save_tone = save_tone;
+			s_quick_load_text = load_text;
+			s_quick_load_tone = load_tone;
 		});
 		MTGS::WaitGS(false);
 	}

@@ -16,4 +16,7 @@ namespace PS4GameMenu
 	// CPU thread: publish the pause panel and request a presentation while paused.
 	void SetInGameMenu(bool visible, unsigned selected, unsigned upscale = 1, unsigned max_upscale = 1,
 		unsigned aspect = 1, bool show_performance_overlay = true);
+	// CPU thread: the lines shown under the quick save and quick load rows, with
+	// their InGameMenuTone. Takes effect at the next SetInGameMenu.
+	void SetInGameQuickStateText(std::string save_text, unsigned save_tone, std::string load_text, unsigned load_tone);
 } // namespace PS4GameMenu

@@ -38,6 +38,8 @@
 #include "ps4/core/GSProfilePS4.h"
 #include "HostPollGate.h"
 #include "GameMenu.h"
+#include "InGameMenuState.h"
+#include "SIO/Sio.h"
 #include "SessionLogs.h"
 #include "ps4/core/WorkerProfilePS4.h"
 
@@ -1237,6 +1239,186 @@ static void ApplyGameAspect(unsigned aspect)
 	ProbeLog("Aspect ratio applied: index=%u\n", aspect);
 }
 
+// (AI-assisted) Quick save/load from the L3+R3 pause panel. The panel only
+// queues the request; the paused CPU loop in main runs it, outside
+// VMManager::Execute and with the VM paused, which is where PCSX2 expects
+// state saves and loads to happen.
+enum QuickStateRequest : int
+{
+	QuickStateNone = 0,
+	QuickStateSave,
+	QuickStateLoad,
+};
+static constexpr s32 QUICK_STATE_SLOT = 1;
+static QuickStateRequest s_quick_state_request = QuickStateNone;
+static std::string s_quick_save_line;
+static std::string s_quick_load_line;
+static unsigned s_quick_save_tone = PS4GameMenu::InGameToneNormal;
+static unsigned s_quick_load_tone = PS4GameMenu::InGameToneNormal;
+
+// Path of this game's quick state, or empty when the game has no serial (BIOS, homebrew).
+static std::string QuickStatePath()
+{
+	const std::string serial = VMManager::GetDiscSerial();
+	if (serial.empty())
+		return {};
+	return VMManager::GetSaveStateFileName(serial.c_str(), VMManager::GetDiscCRC(), QUICK_STATE_SLOT);
+}
+
+static void DescribeQuickStateFile()
+{
+	s_quick_load_tone = PS4GameMenu::InGameToneNormal;
+	const std::string path = QuickStatePath();
+	FILESYSTEM_STAT_DATA sd;
+	if (path.empty())
+	{
+		s_quick_load_line = "Este juego no tiene número de serie: el guardado rápido no está disponible";
+		return;
+	}
+	if (!FileSystem::StatFile(path.c_str(), &sd))
+	{
+		s_quick_load_line = "Todavía no hay ningún guardado rápido de este juego";
+		return;
+	}
+	const long long age = std::max<long long>(0, static_cast<long long>(std::time(nullptr) - sd.ModificationTime));
+	char when[64];
+	if (age < 60)
+		std::snprintf(when, sizeof(when), "hace unos segundos");
+	else if (age < 3600)
+		std::snprintf(when, sizeof(when), "hace %lld min", age / 60);
+	else if (age < 86400)
+		std::snprintf(when, sizeof(when), "hace %lld h", age / 3600);
+	else
+		std::snprintf(when, sizeof(when), "hace %lld días", age / 86400);
+	char line[160];
+	std::snprintf(line, sizeof(line), "Vuelve al último guardado rápido (%s)", when);
+	s_quick_load_line = line;
+}
+
+static void PublishQuickStateText()
+{
+	PS4GameMenu::SetInGameQuickStateText(s_quick_save_line, s_quick_save_tone, s_quick_load_line, s_quick_load_tone);
+}
+
+// Called when the panel opens: default text under both rows.
+static void ResetQuickStateText()
+{
+	s_quick_state_request = QuickStateNone;
+	s_quick_save_line.clear();
+	s_quick_save_tone = PS4GameMenu::InGameToneNormal;
+	DescribeQuickStateFile();
+	PublishQuickStateText();
+}
+
+static void SetQuickRowLine(QuickStateRequest kind, std::string line, unsigned tone)
+{
+	if (kind == QuickStateSave)
+	{
+		s_quick_save_line = std::move(line);
+		s_quick_save_tone = tone;
+	}
+	else
+	{
+		s_quick_load_line = std::move(line);
+		s_quick_load_tone = tone;
+	}
+	PublishQuickStateText();
+	PublishGameMenu();
+}
+
+static void QueueQuickState(QuickStateRequest kind)
+{
+	const std::string path = QuickStatePath();
+	if (path.empty())
+	{
+		SetQuickRowLine(kind, "Este juego no tiene número de serie: el guardado rápido no está disponible",
+			PS4GameMenu::InGameToneError);
+		return;
+	}
+	if (kind == QuickStateLoad && !FileSystem::FileExists(path.c_str()))
+	{
+		SetQuickRowLine(kind, "No hay ningún guardado rápido que cargar. Usa antes Guardado rápido",
+			PS4GameMenu::InGameToneError);
+		return;
+	}
+	if (MemcardBusy::IsBusy())
+	{
+		// PCSX2 refuses states while the game is writing the memory card, so a
+		// state can never hold a half-written save.
+		SetQuickRowLine(kind, "La memory card está ocupada (el juego acaba de guardar). Espera unos segundos y repite",
+			PS4GameMenu::InGameToneError);
+		return;
+	}
+	ProbeLog("Quick %s: queued for slot %d (%s)\n", kind == QuickStateSave ? "save" : "load", QUICK_STATE_SLOT, path.c_str());
+	// The panel is redrawn with the "working" line before the paused loop
+	// starts the (blocking) save or load.
+	SetQuickRowLine(kind, kind == QuickStateSave ? "Guardando..." : "Cargando...", PS4GameMenu::InGameToneBusy);
+	s_quick_state_request = kind;
+}
+
+static void RunQuickStateRequest()
+{
+	const QuickStateRequest request = s_quick_state_request;
+	if (request == QuickStateNone)
+		return;
+	s_quick_state_request = QuickStateNone;
+	if (!s_game_menu_open || VMManager::GetState() != VMState::Paused)
+		return;
+
+	const std::string path = QuickStatePath();
+	const auto start = Common::Timer::GetCurrentValue();
+	const auto elapsed_ms = [start]() {
+		return Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - start);
+	};
+	if (request == QuickStateSave)
+	{
+		bool failed = false;
+		std::string failure;
+		// zip_on_thread=false: the panel is paused anyway, and a synchronous
+		// write means "saved" is only shown once the file is complete.
+		VMManager::SaveStateToSlot(QUICK_STATE_SLOT, false, [&failed, &failure](const std::string& message) {
+			failed = true;
+			failure = message;
+		});
+		FILESYSTEM_STAT_DATA sd = {};
+		if (!failed && !FileSystem::StatFile(path.c_str(), &sd))
+		{
+			failed = true;
+			failure = "el archivo no se ha creado";
+		}
+		if (failed)
+		{
+			ProbeLog("Quick save: slot %d FAILED after %.0f ms: %s\n", QUICK_STATE_SLOT, elapsed_ms(), failure.c_str());
+			SetQuickRowLine(QuickStateSave, "No se pudo guardar: " + failure, PS4GameMenu::InGameToneError);
+			return;
+		}
+		ProbeLog("Quick save: slot %d written to %s (%lld bytes) in %.0f ms\n", QUICK_STATE_SLOT, path.c_str(),
+			static_cast<long long>(sd.Size), elapsed_ms());
+		DescribeQuickStateFile();
+		SetQuickRowLine(QuickStateSave, "Partida guardada. Pulsa Círculo para seguir jugando", PS4GameMenu::InGameToneGood);
+		return;
+	}
+
+	Error error;
+	if (!VMManager::LoadStateFromSlot(QUICK_STATE_SLOT, false, &error))
+	{
+		ProbeLog("Quick load: slot %d FAILED after %.0f ms: %s\n", QUICK_STATE_SLOT, elapsed_ms(),
+			error.GetDescription().c_str());
+		SetQuickRowLine(QuickStateLoad, "No se pudo cargar: " + error.GetDescription(), PS4GameMenu::InGameToneError);
+		return;
+	}
+	ProbeLog("Quick load: slot %d loaded from %s in %.0f ms; resuming\n", QUICK_STATE_SLOT, path.c_str(), elapsed_ms());
+	// The guest clock jumped to the saved cycle count; restart the per-second
+	// counters from it instead of reporting one bogus interval.
+	s_last_ee_cycle = cpuRegs.cycle;
+	s_host_poll_gate.Reset();
+	s_game_menu_open = false;
+	s_game_menu_direction = 0;
+	s_blocked_pad_buttons |= s_previous_host_buttons; // the X that chose "load" must not reach the game
+	PS4GameMenu::SetInGameMenu(false, 0);
+	VMManager::SetPaused(false);
+}
+
 void VMHostPoll()
 {
 	++s_host_poll_calls;
@@ -1449,6 +1631,7 @@ void VMHostPoll()
 			Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - readres_t0),
 			MTGS::GetCurrentVsyncQueueSize());
 		ProbeLog("pause step: PublishGameMenu begin\n");
+		ResetQuickStateText();
 		PublishGameMenu();
 		SessionSummary::Mark();
 		ProbeLog("Emulator menu: opened with L3+R3 total_ms=%.2f verbose=%d\n",
@@ -1457,32 +1640,39 @@ void VMHostPoll()
 	}
 	if (!s_game_menu_open)
 		return;
+	// A quick save or load is queued: ignore the pad until the paused loop has run it.
+	if (s_quick_state_request != QuickStateNone)
+		return;
 
 	const bool cancel = (pressed & ORBIS_PAD_BUTTON_CIRCLE) != 0 || chord_edge;
 	const bool confirm = (pressed & ORBIS_PAD_BUTTON_CROSS) != 0;
+	const unsigned row = s_game_menu_selection;
+	const bool adjustable_row = row == PS4GameMenu::InGameRowResolution || row == PS4GameMenu::InGameRowAspect ||
+		row == PS4GameMenu::InGameRowOverlay;
+	const bool quick_row = row == PS4GameMenu::InGameRowQuickSave || row == PS4GameMenu::InGameRowQuickLoad;
 #if defined(PCSX2_PS4_VM_BOOT_JIT)
 	// Queue a VU1 recompiler snapshot from the paused menu's diagnostic action.
 	// The MTVU worker takes it at the next program boundary; file I/O stays off
 	// emulation threads and the session archiver picks up the completed dump.
-	if (s_game_session && s_game_menu_selection == 3 && (pressed & ORBIS_PAD_BUTTON_L1))
+	if (s_game_session && row == PS4GameMenu::InGameRowOverlay && (pressed & ORBIS_PAD_BUTTON_L1))
 	{
 		g_orbis_vu1_dump_request.store(1, std::memory_order_release);
 		ProbeLog("VU1 dump requested from paused menu; captured at next VU1 program boundary\n");
 		return;
 	}
 #endif
-	if (cancel || (confirm && s_game_menu_selection != 1 && s_game_menu_selection != 2 && s_game_menu_selection != 3))
+	if (cancel || (confirm && !adjustable_row && !quick_row))
 	{
 		s_game_menu_open = false;
 		s_blocked_pad_buttons |= raw;
 		PS4GameMenu::SetInGameMenu(false, 0);
-		if (!cancel && s_game_menu_selection == 4)
+		if (!cancel && row == PS4GameMenu::InGameRowMainMenu)
 		{
 			s_return_to_main_menu.store(true, std::memory_order_release);
 			ProbeLog("VM stop request: return to main menu\n");
 			VMManager::SetState(VMState::Stopping);
 		}
-		else if (!cancel && s_game_menu_selection == 5)
+		else if (!cancel && row == PS4GameMenu::InGameRowExit)
 		{
 			ProbeLog("VM stop request: exit application\n");
 			VMManager::SetState(VMState::Stopping);
@@ -1495,7 +1685,13 @@ void VMHostPoll()
 	}
 	else
 	{
-		if (confirm && s_game_menu_selection == 3)
+		if (confirm && quick_row)
+		{
+			QueueQuickState(row == PS4GameMenu::InGameRowQuickSave ? QuickStateSave : QuickStateLoad);
+			s_game_menu_direction = 0;
+			return;
+		}
+		if (confirm && row == PS4GameMenu::InGameRowOverlay)
 		{
 			s_game_show_performance_overlay = !s_game_show_performance_overlay;
 			ApplyPerformanceOverlay();
@@ -1516,13 +1712,13 @@ void VMHostPoll()
 		{
 			s_game_menu_next_repeat = elapsed + (navigation == s_game_menu_direction ? 0.12 : 0.35);
 			if (navigation == ORBIS_PAD_BUTTON_UP)
-				s_game_menu_selection = s_game_menu_selection == 0 ? 5 : s_game_menu_selection - 1;
+				s_game_menu_selection = s_game_menu_selection == 0 ? PS4GameMenu::InGameRowCount - 1 : s_game_menu_selection - 1;
 			else if (navigation == ORBIS_PAD_BUTTON_DOWN)
-				s_game_menu_selection = (s_game_menu_selection + 1) % 6;
-			else if (s_game_menu_selection == 1 || s_game_menu_selection == 2 || s_game_menu_selection == 3)
+				s_game_menu_selection = (s_game_menu_selection + 1) % PS4GameMenu::InGameRowCount;
+			else if (adjustable_row)
 			{
 				const int delta = navigation == ORBIS_PAD_BUTTON_LEFT ? -1 : 1;
-				if (s_game_menu_selection == 1)
+				if (row == PS4GameMenu::InGameRowResolution)
 				{
 					const unsigned requested = static_cast<unsigned>(std::clamp(static_cast<int>(s_game_upscale) + delta,
 						1, static_cast<int>(s_max_game_upscale)));
@@ -1536,7 +1732,7 @@ void VMHostPoll()
 							requested, s_game_upscale, s_max_game_upscale);
 					}
 				}
-				else if (s_game_menu_selection == 2)
+				else if (row == PS4GameMenu::InGameRowAspect)
 				{
 					s_game_aspect = static_cast<unsigned>((static_cast<int>(s_game_aspect) + delta + 5) % 5);
 					ApplyGameAspect(s_game_aspect);
@@ -2267,6 +2463,7 @@ static void* RunVM(void*)
 			{
 				// Keep reading menu controls while the EE is paused.
 				VMHostPoll();
+				RunQuickStateRequest();
 				Threading::Sleep(16);
 			}
 			else
