@@ -519,10 +519,13 @@ static u32 RepairBrokenChains(std::vector<u8>& image, std::vector<u32>* changed,
 // are erased or consistent with their ECC are never touched (an old deleted file's data
 // stays). Returns how many pages were reset; their offsets go to `changed` so the caller
 // can write them back, and the orphan count to `orphans`.
-static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* changed, u32* orphans = nullptr)
+static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* changed, u32* orphans = nullptr,
+	u32* in_use_fixed = nullptr)
 {
 	if (orphans)
 		*orphans = 0;
+	if (in_use_fixed)
+		*in_use_fixed = 0;
 	static constexpr char Magic[] = "Sony PS2 Memory Card Format ";
 	if (image.size() < 0x200 || std::memcmp(image.data(), Magic, sizeof(Magic) - 1) != 0)
 		return 0;
@@ -632,14 +635,12 @@ static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* chan
 		}
 	}
 
-	u32 reset = 0, orphan_count = 0;
+	u32 reset = 0, orphan_count = 0, reecc = 0;
 	for (u32 c = 0; c < alloc_end; c++)
 	{
 		const bool in_use = (fat[c] & 0x80000000u) != 0;
 		const bool orphan = in_use && tree_ok && !reached[c];
 		orphan_count += orphan;
-		if (in_use && !orphan)
-			continue;
 		for (u32 p = 0; p < ppc; p++)
 		{
 			const u32 page = (alloc_offset + c) * ppc + p;
@@ -654,15 +655,29 @@ static u32 RepairFreeClusterPages(std::vector<u8>& image, std::vector<u32>* chan
 				ecc_ok = std::memcmp(ecc, data + page_len + chunk * 3, 3) == 0;
 			}
 			if (ecc_ok)
-				continue; // valid data (an old deleted file's): leave it
-			std::memset(data, 0xFF, raw_page);
-			reset++;
+				continue; // valid data: leave it
+			if (in_use && !orphan)
+			{
+				// A page of a file MCMAN cannot read: the same failure on every rewrite of its
+				// erase block (the tail of a save cut short, at the cluster MCMAN could not write).
+				// Its data stays and its ECC is computed again, so the page reads as it is.
+				for (u32 chunk = 0; chunk < page_len / 128; chunk++)
+					McdEccChunk(data + chunk * 128, data + page_len + chunk * 3);
+				reecc++;
+			}
+			else
+			{
+				std::memset(data, 0xFF, raw_page);
+				reset++;
+			}
 			if (changed)
 				changed->push_back(static_cast<u32>(static_cast<size_t>(page) * raw_page));
 		}
 	}
 	if (orphans)
 		*orphans = orphan_count;
+	if (in_use_fixed)
+		*in_use_fixed = reecc;
 	return reset;
 }
 
@@ -798,18 +813,19 @@ bool FileMemoryCard::LoadCache(uint slot)
 		if (cut)
 			std::printf("[mcd] slot %u: %u file(s) with a broken cluster chain, ended at their last valid cluster: %s\n", slot, cut,
 				broken.c_str());
-		const size_t chain_pages = changed.size();
-		u32 orphans = 0;
-		const u32 reset = RepairFreeClusterPages(m_cache[slot], &changed, &orphans);
+		u32 orphans = 0, in_use_fixed = 0;
+		const u32 reset = RepairFreeClusterPages(m_cache[slot], &changed, &orphans, &in_use_fixed);
 		if (orphans)
 			std::printf("[mcd] slot %u: %u cluster(s) marked in use belong to no file (left by saves cut short)\n", slot, orphans);
+		if (in_use_fixed)
+			std::printf("[mcd] slot %u: %u page(s) of files had an ECC that did not match their data; ECC computed again\n", slot,
+				in_use_fixed);
 		for (const u32 offset : changed)
 			MarkDirty(slot, offset, 528);
 		if (reset)
 		{
-			std::printf("[mcd] slot %u: %u page(s) in clusters no file uses were neither erased nor ECC-consistent; set to erased "
-						"(first at byte 0x%X, page 0x%X)\n",
-				slot, reset, changed[chain_pages], changed[chain_pages] / 528);
+			std::printf("[mcd] slot %u: %u page(s) in clusters no file uses were neither erased nor ECC-consistent; set to erased\n",
+				slot, reset);
 		}
 		else
 			std::printf("[mcd] slot %u: no unusable pages in clusters no file uses\n", slot);
